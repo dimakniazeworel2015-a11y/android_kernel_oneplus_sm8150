@@ -178,9 +178,11 @@ jobs:
           echo "Appending config fragment to ${DEFCFG}"
           cat >> "${DEFCFG}" <<'EOF'
           # --- KernelSU-Next (legacy) + SUSFS + selinux_hide ---
+          # NOTE: keep MANUAL hook (no KPROBES) to match the working kernel and
+          # avoid double-hook. selinux_hide core (fake status + selinux/status
+          # fops patch) is always compiled and enabled by default without kprobes.
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_KPROBES_HOOK=y
           # --- Preserve WiFi vermagic: 4.14.356-perf-g040f6e737afe SMP preempt mod_unload modversions aarch64 ---
           CONFIG_LOCALVERSION="-perf-g040f6e737afe"
           # CONFIG_LOCALVERSION_AUTO is not set
@@ -241,7 +243,6 @@ jobs:
           CONFIG_PREEMPT=y
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_KPROBES_HOOK=y
           CONFIG_KERNEL_GZIP=y
           CONFIG_KERNEL_BZIP2=n
           CONFIG_KERNEL_LZMA=n
@@ -268,7 +269,7 @@ jobs:
               --set-str CONFIG_LOCALVERSION "-perf-g040f6e737afe" --disable CONFIG_LOCALVERSION_AUTO \
               --enable CONFIG_MODVERSIONS --enable CONFIG_MODULE_UNLOAD \
               --enable CONFIG_SMP --enable CONFIG_PREEMPT \
-              --enable CONFIG_KSU --enable CONFIG_KSU_SUSFS --enable CONFIG_KSU_KPROBES_HOOK \
+              --enable CONFIG_KSU --enable CONFIG_KSU_SUSFS \
               --enable CONFIG_KERNEL_GZIP \
               --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
@@ -306,8 +307,8 @@ jobs:
             sed -i "s/^${e}=.*/${e}=y/" out/.config
             grep -q "^${e}=y" out/.config || echo "${e}=y" >> out/.config
           done
-          # KSU / SUSFS / selinux_hide kprobes toggle -> force =y
-          for e in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_KPROBES_HOOK; do
+          # KSU / SUSFS -> force =y
+          for e in CONFIG_KSU CONFIG_KSU_SUSFS; do
             sed -i "s/^# ${e} is not set/${e}=y/" out/.config
             sed -i "s/^${e}=.*/${e}=y/" out/.config
             grep -q "^${e}=y" out/.config || echo "${e}=y" >> out/.config
@@ -329,7 +330,7 @@ jobs:
           set -euo pipefail
           grep -q '^CONFIG_LOCALVERSION="-perf-g040f6e737afe"' out/.config || { echo "FATAL: CONFIG_LOCALVERSION wrong"; exit 1; }
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' out/.config || { echo "FATAL: LOCALVERSION_AUTO still enabled"; exit 1; }
-          for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_SMP CONFIG_PREEMPT CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_KPROBES_HOOK; do
+          for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_SMP CONFIG_PREEMPT CONFIG_KSU CONFIG_KSU_SUSFS; do
             grep -q "^${e}=y" out/.config || { echo "FATAL: ${e} not =y"; exit 1; }
           done
           echo "Vermagic + KSU config OK"
