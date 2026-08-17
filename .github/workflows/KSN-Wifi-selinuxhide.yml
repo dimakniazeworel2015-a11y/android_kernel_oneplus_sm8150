@@ -111,11 +111,18 @@ jobs:
           echo "selinux_hide.c OK"
 
       # ------------------------------------------------------------------
-      # SUSFS (kernel-4.14) integration. Mirrors kernelsu-susfs.yml but the
-      # KernelSU-side patch is applied against KernelSU-Next/kernel (the tree
-      # the legacy setup.sh symlinked to drivers/kernelsu), NOT a tiann KernelSU
-      # clone. `|| true` mirrors the upstream workflow so partial-hunk fuzz on
-      # this 4.14 tree does not hard-fail the run.
+      # SUSFS (kernel-4.14) integration.
+      #
+      # Only the kernel-side patch (50_add_susfs_in_kernel-4.14.patch) is
+      # applied. The KernelSU-side patch (10_enable_susfs_for_ksu.patch) is
+      # DELIBERATELY NOT applied: it targets the classic flat tiann/KernelSU
+      # kernel/ layout (kernel/core_hook.c, kernel/ksud.c, kernel/allowlist.c,
+      # kernel/throne_tracker.c, ...). The KernelSU-Next *legacy* branch used
+      # here has a refactored layout (kernel/core/, kernel/feature/,
+      # kernel/hook/, ...) where 16 of the 18 files the 10-patch touches do not
+      # exist, so it can only ever "can't find file to patch" / .rej. See the
+      # separate "Enable KSU_SUSFS Kconfig..." step which injects just the
+      # Kconfig symbols the 50-patch #ifdef guards need.
       # ------------------------------------------------------------------
       - name: Clone SUSFS
         run: |
@@ -126,18 +133,116 @@ jobs:
         run: |
           set -euo pipefail
           # 1) Copy SUSFS sources into the kernel tree
+          #    (include/linux/susfs_def.h defines INODE_STATE_SUS_KSTAT = BIT(26))
           cp ../susfs4ksu/kernel_patches/fs/* fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-          # 2) Apply the main kernel-side SUSFS patch
+          test -f include/linux/susfs_def.h || { echo "FATAL: susfs_def.h missing after copy"; exit 1; }
+          grep -q 'INODE_STATE_SUS_KSTAT' include/linux/susfs_def.h \
+            || { echo "FATAL: INODE_STATE_SUS_KSTAT not defined in susfs_def.h"; exit 1; }
+
+          # 2) Apply the main kernel-side SUSFS patch.
+          #    NOTE: hunk #1 of the fs/proc/task_mmu.c diff (the
+          #    '#include <linux/susfs_def.h>' block near line 19) FAILS on
+          #    lineage-22.1 because LineageOS added '#include <linux/ctype.h>'
+          #    right after '#include <linux/mm_inline.h>', which perturbs the
+          #    trailing context the hunk needs. Hunks #2/#3 (which reference
+          #    INODE_STATE_SUS_KSTAT) still apply, so without the include the
+          #    build fails with "use of undeclared identifier
+          #    'INODE_STATE_SUS_KSTAT'". We let patch run, then repair the one
+          #    missing include manually just below (idempotent, grep-guarded).
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${SUSFS_KVER}.patch ./
           patch -p1 < 50_add_susfs_in_kernel-${SUSFS_KVER}.patch || true
-          # 3) Apply the KernelSU-side SUSFS enable patch against KernelSU-Next/kernel
-          if [ -f ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
-            cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU-Next/
-            ( cd KernelSU-Next && patch -p1 < 10_enable_susfs_for_ksu.patch || true )
+
+          # 3) Repair the failed task_mmu.c hunk #1: inject the susfs_def.h
+          #    include after <linux/mm_inline.h> if it is not already present.
+          #    This is the exact intent of the rejected hunk and makes
+          #    INODE_STATE_SUS_KSTAT visible to fs/proc/task_mmu.c.
+          if ! grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c; then
+            sed -i '/#include <linux\/mm_inline.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux\/susfs_def.h>\n#endif' fs/proc/task_mmu.c
+            echo "[susfs] injected susfs_def.h include into fs/proc/task_mmu.c"
           else
-            echo "No 10_enable_susfs_for_ksu.patch in this SUSFS branch; KSU-Next legacy already carries SUSFS glue."
+            echo "[susfs] susfs_def.h already included in fs/proc/task_mmu.c"
           fi
+          # Hard gate: the include MUST be present now, or the build will fail
+          # the same way. Fail loudly here instead of 30 min into the compile.
+          grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c \
+            || { echo "FATAL: susfs_def.h include still missing from task_mmu.c"; exit 1; }
+          echo "==== task_mmu.c include region ===="
+          sed -n '19,26p' fs/proc/task_mmu.c
+
+      # ------------------------------------------------------------------
+      # KSU_SUSFS Kconfig symbols. The 50-patch guards every SUSFS code path
+      # with #ifdef CONFIG_KSU_SUSFS_SUS_* . On the classic layout those
+      # symbols come from 10_enable_susfs_for_ksu.patch, which we do NOT apply
+      # (incompatible layout, see above). We add just the Kconfig menu to the
+      # KernelSU-Next legacy kernel/Kconfig so CONFIG_KSU_SUSFS and its
+      # sub-options exist and can be turned on by the defconfig fragment.
+      # Idempotent: only appended if KSU_SUSFS is not already declared.
+      # ------------------------------------------------------------------
+      - name: Enable KSU_SUSFS Kconfig (legacy layout)
+        working-directory: ./kernel
+        run: |
+          set -euo pipefail
+          KSU_KCFG="KernelSU-Next/kernel/Kconfig"
+          test -f "${KSU_KCFG}" || { echo "FATAL: ${KSU_KCFG} not found"; exit 1; }
+          if grep -q 'config KSU_SUSFS' "${KSU_KCFG}"; then
+            echo "[susfs] KSU_SUSFS Kconfig already present; skipping"
+          else
+            # Append a self-contained SUSFS Kconfig menu at EOF. It sits after
+            # the "KernelSU" menu's endmenu (own menu, own endmenu) which is
+            # valid Kconfig; only symbol existence matters for the 50-patch
+            # #ifdef guards. Written column-0 via a quoted heredoc so Kconfig
+            # `config`/`menu` keywords are not indented.
+            cat >> "${KSU_KCFG}" <<'KCFG'
+
+          menu "KernelSU - SUSFS"
+
+          config KSU_SUSFS
+          	bool "KernelSU addon - SUSFS"
+          	depends on KSU
+          	default y
+
+          config KSU_SUSFS_SUS_PATH
+          	bool "Enable to hide suspicious path"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_SUS_MOUNT
+          	bool "Enable to hide suspicious mounts"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_SUS_KSTAT
+          	bool "Enable to spoof suspicious kstat"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_TRY_UMOUNT
+          	bool "Enable try_umount"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_SPOOF_UNAME
+          	bool "Enable to spoof uname"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_ENABLE_LOG
+          	bool "Enable susfs kernel logging"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_OPEN_REDIRECT
+          	bool "Enable open redirect"
+          	depends on KSU_SUSFS
+          	default y
+
+          endmenu
+          KCFG
+            echo "[susfs] appended KSU_SUSFS Kconfig menu"
+          fi
+          echo "==== KSU_SUSFS Kconfig symbols ===="
+          grep -n 'config KSU_SUSFS' "${KSU_KCFG}" || true
 
       # Patch 1: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) via pattern (idempotent)
       - name: Apply hugetlbpage fix patch
