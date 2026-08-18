@@ -122,6 +122,17 @@ jobs:
           test -f KernelSU-Next/kernel/feature/selinux_hide.c \
             || { echo "FATAL: kernel/feature/selinux_hide.c missing (not the legacy modular tree?)"; exit 1; }
           echo "modular KSU-Next tree OK: selinux_hide.c present"
+          # selinux_hide.c references the global bool `ksu_input_hook` (TRUE while
+          # KSU's MANUAL input hook initialises). With kprobes hooks (MANUAL_HOOK
+          # off) nothing defines it -> ld "undefined symbol: ksu_input_hook"
+          # (referenced by selinux_hide.o:ksu_hide_init_thread). Define it =false
+          # in a compiled KSU source so it links AND selinux_hide proceeds
+          # immediately (the `while (READ_ONCE(ksu_input_hook)) msleep()` is skipped).
+          F=KernelSU-Next/kernel/core/init.c
+          if ! grep -q 'ksu_input_hook' "$F"; then
+            printf '\n#include <linux/types.h>\n#include <linux/cache.h>\nbool ksu_input_hook __read_mostly = false;\n' >> "$F"
+          fi
+          echo "ksu_input_hook def:"; grep -n 'ksu_input_hook' "$F" || { echo "FATAL: ksu_input_hook not defined"; exit 1; }
 
       # Patch 1: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) via pattern (idempotent)
       - name: Apply hugetlbpage fix patch
