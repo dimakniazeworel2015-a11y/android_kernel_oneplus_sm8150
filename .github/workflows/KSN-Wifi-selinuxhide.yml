@@ -160,6 +160,43 @@ jobs:
           echo "ksu_input_hook def:"; grep -n 'ksu_input_hook' "$F" \
             || { echo "FATAL: ksu_input_hook not defined"; exit 1; }
 
+      # ------------------------------------------------------------------
+      # KSN sulog time API fix (idempotent, grep-guarded).
+      #
+      # drivers/kernelsu -> KernelSU-Next/kernel (symlink), so the real file
+      # is KernelSU-Next/kernel/sulog/event.c. It declares `struct timespec64
+      # ts` and, in the pre-4.19 #else branch, calls the NON-64
+      # get_monotonic_boottime(struct timespec *) (include/linux/
+      # timekeeping32.h:84) -> "incompatible pointer types passing
+      # 'struct timespec64 *' to parameter of type 'struct timespec *'"
+      # (-Werror) at event.c:62 and :97 on this 4.14.356 tree.
+      #
+      # Fix: call ktime_get_boottime_ts64(struct timespec64 *) instead. That
+      # accessor EXISTS on this tree (include/linux/timekeeping.h:141), takes
+      # a timespec64* (matches the existing `ts` var), and returns identical
+      # boottime seconds. This is type-correct with NO cast and NO
+      # -Wno-error, so it is the safest option (a cast/no-error would only
+      # mask the mismatch). After the sed both #if/#else arms become
+      # identical, which is fine.
+      # ------------------------------------------------------------------
+      - name: KSN sulog time API fix (timespec64 -> ktime_get_boottime_ts64)
+        working-directory: ./kernel
+        run: |
+          set -euo pipefail
+          F=KernelSU-Next/kernel/sulog/event.c
+          test -f "$F" || { echo "FATAL: $F missing (KSU-Next legacy sulog absent)"; exit 1; }
+          if grep -q 'get_monotonic_boottime(&ts)' "$F"; then
+            sed -i 's/get_monotonic_boottime(&ts)/ktime_get_boottime_ts64(\&ts)/g' "$F"
+            echo "[sulog] patched get_monotonic_boottime -> ktime_get_boottime_ts64"
+          else
+            echo "[sulog] no non-64 call site (already patched or upstream changed) — ok"
+          fi
+          echo "==== sulog boottime call sites after patch ===="
+          grep -n -E 'ktime_get_boottime_ts64\(&ts\)|get_monotonic_boottime\(&ts\)' "$F" || true
+          if grep -q 'get_monotonic_boottime(&ts)' "$F"; then
+            echo "FATAL: non-64 get_monotonic_boottime(&ts) still present"; exit 1
+          fi
+
       # Patch 1: arch/arm64/mm/hugetlbpage.c (idempotent, only if the file
       # has the old shape). Device ships hugetlb pieces so keep it building.
       - name: Apply hugetlbpage fix patch (idempotent, tolerant)
@@ -209,7 +246,8 @@ jobs:
                    CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_KPROBES_HOOK \
                    CONFIG_LOCALVERSION CONFIG_LOCALVERSION_AUTO \
                    CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
-                   CONFIG_LTO CONFIG_LTO_CLANG CONFIG_THINLTO; do
+                   CONFIG_LTO CONFIG_LTO_CLANG CONFIG_THINLTO \
+                   CONFIG_BUILD_ARM64_DT_OVERLAY; do
             drop "$s"
           done
           cat >> "$DST" <<'EOF'
@@ -233,6 +271,18 @@ jobs:
           # CONFIG_LTO is not set
           # CONFIG_LTO_CLANG is not set
           # CONFIG_THINLTO is not set
+          # --- DT overlay OFF: BUILD_ARM64_DT_OVERLAY=y makes `dtbs` compile
+          #     sm8150-mtp-overlay.dtbo (a /plugin/ overlay) with the in-tree
+          #     scripts/dtc, which chokes on the base pm8150.dtsi top-level
+          #     `&spmi_bus {}` reference ("pm8150.dtsi:21.1-10 syntax error").
+          #     The bootable image is the APPENDED_DTB_IMAGE (Image.gz-dtb) built
+          #     from the plain board .dtb files (sm8150*.dtb compile fine); the
+          #     .dtbo overlay is NOT used by this AnyKernel3 appended-dtb flow.
+          #     Overlay and APPENDED_DTB_IMAGE are independent Kconfigs (both
+          #     only depends-on OF), so disabling overlay keeps the boot dtb.
+          #     With overlay off the dts Makefile builds plain sm8150-v2-mtp.dtb
+          #     instead, and DTC_FLAGS=-@ is not exported. ---
+          # CONFIG_BUILD_ARM64_DT_OVERLAY is not set
           EOF
           echo "==== tail of transformed defconfig ===="
           tail -n 30 "$DST"
@@ -275,6 +325,12 @@ jobs:
           set_n CONFIG_THINLTO
           # CFI depends on LTO; device has CFI off. Keep it off (do NOT enable).
           set_n CONFIG_CFI_CLANG
+          # DT overlay OFF: the sm8150-mtp-overlay.dtbo (/plugin/) fails to
+          # compile with the in-tree dtc on this 4.14 tree (pm8150.dtsi top-level
+          # &spmi_bus{} syntax error). The bootable Image.gz-dtb comes from the
+          # APPENDED_DTB_IMAGE (plain board .dtb), independent of overlay. Pin off
+          # so olddefconfig (overlay only depends-on OF) can't re-enable it.
+          set_n CONFIG_BUILD_ARM64_DT_OVERLAY
           set_str CONFIG_LOCALVERSION "-perf"
 
           # Re-resolve twice so the KSU dep chains settle deterministically.
@@ -304,7 +360,9 @@ jobs:
           if grep -q '^CONFIG_LTO_CLANG=y' "$C"; then echo "FATAL: LTO_CLANG still on (must be off)"; exit 1; fi
           # susfs must be entirely gone
           if grep -q 'CONFIG_KSU_SUSFS' "$C"; then echo "FATAL: susfs symbol in .config"; exit 1; fi
-          echo "Boot/vermagic/KSN config gate OK (LTO off)"
+          # DT overlay must be OFF (broken .dtbo compile; appended dtb is unaffected)
+          if grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' "$C"; then echo "FATAL: DT_OVERLAY still on (breaks dtbs)"; exit 1; fi
+          echo "Boot/vermagic/KSN config gate OK (LTO off, DT overlay off)"
 
       - name: Prepare scripts and headers
         working-directory: ./kernel
