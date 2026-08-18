@@ -63,9 +63,12 @@ jobs:
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_selinuxhide_wifi' }}
-      # AOSP clang r487747c (clang-18-class) — ships ld.lld with working
-      # arm64 LTO. Path is exported into $PATH in every build step.
-      AOSP_CLANG_VER: 'r487747c'
+      # AOSP-based clang (ZyCromerZ mirror) — single-file .tar.gz that ships
+      # clang + ld.lld + LLVMgold with working arm64 full-LTO, plus bundled
+      # aarch64/arm GNU binutils. Extracts to $HOME/clang/bin. Stable URL
+      # (the googlesource +archive slug used before is NOT a real tarball ->
+      # "gzip: stdin: not in gzip format", which failed build run 32093097805).
+      CLANG_URL: 'https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz'
 
     steps:
       - name: Checkout repository (holds hotdogb_defconfig)
@@ -98,13 +101,17 @@ jobs:
             binutils-aarch64-linux-gnu binutils \
             make python3 libssl-dev libelf-dev build-essential bc bison flex unzip \
             ca-certificates xz-utils cpio device-tree-compiler git git-lfs patch curl
-          # AOSP prebuilt clang (has ld.lld + LLVMgold for arm64 LTO)
+          # AOSP-based clang (single-file tarball; extracts bin/ at top level)
           mkdir -p "$HOME/clang"
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${AOSP_CLANG_VER}.tar.gz"
-          echo "Fetching AOSP clang ${AOSP_CLANG_VER}"
-          curl -Lo /tmp/clang.tgz "$CLANG_URL"
-          tar -C "$HOME/clang" -xf /tmp/clang.tgz
+          echo "Fetching clang: ${CLANG_URL}"
+          curl -Lfo /tmp/clang.tgz "${CLANG_URL}"
+          # verify it really is gzip before extracting (fail loud otherwise)
+          file /tmp/clang.tgz || true
+          gzip -t /tmp/clang.tgz || { echo "FATAL: clang download is not a gzip tarball"; exit 1; }
+          tar -C "$HOME/clang" -xzf /tmp/clang.tgz
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          test -x "$HOME/clang/bin/clang" || { echo "FATAL: clang binary missing after extract"; ls -la "$HOME/clang"; exit 1; }
+          test -x "$HOME/clang/bin/ld.lld" || { echo "FATAL: ld.lld missing (LTO needs it)"; exit 1; }
           "$HOME/clang/bin/clang" --version || true
           # AnyKernel3 packaging template
           git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3
