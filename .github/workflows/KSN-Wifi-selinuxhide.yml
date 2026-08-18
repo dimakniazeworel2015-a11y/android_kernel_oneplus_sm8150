@@ -182,7 +182,16 @@ jobs:
           cp -v "${KP}/include/linux/"* include/linux/ 2>/dev/null || true
 
           echo "==== apply kernel-side 50_ susfs patch at kernel root ===="
-          patch -p1 --no-backup-if-mismatch < "${KP}/50_add_susfs_in_kernel-4.14.patch"
+          # task_mmu.c hunk #1 (the <linux/susfs_def.h> include) fails on lineage
+          # because an added <linux/ctype.h> after <linux/mm_inline.h> perturbs it;
+          # let patch continue (|| true), then repair the missing include below.
+          patch -p1 --no-backup-if-mismatch < "${KP}/50_add_susfs_in_kernel-4.14.patch" || true
+          if ! grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c; then
+            sed -i '/#include <linux\/mm_inline.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux\/susfs_def.h>\n#endif' fs/proc/task_mmu.c
+          fi
+          grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c \
+            || { echo "FATAL: task_mmu susfs_def include not injected"; exit 1; }
+          echo "task_mmu.c susfs_def include OK"
 
           echo "==== apply KSU-side 10_ bridge inside KernelSU-Next/ ===="
           cp "${KP}/KernelSU/10_enable_susfs_for_ksu.patch" KernelSU-Next/
