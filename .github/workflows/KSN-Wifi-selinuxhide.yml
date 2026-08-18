@@ -1,4 +1,4 @@
-name: Build kernel (KSN legacy + SUSFS + selinux_hide) & WIFI
+name: Build kernel (KSN legacy modular + selinux_hide, NO susfs) & WIFI
 
 on:
   workflow_dispatch:
@@ -39,10 +39,6 @@ jobs:
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_selinuxhide_wifi' }}
-      # SUSFS (kernel-4.14) integration
-      SUSFS_SOURCE: "https://gitlab.com/simonpunk/susfs4ksu.git"
-      SUSFS_BRANCH: "kernel-4.14"
-      SUSFS_KVER: "4.14"
 
     steps:
       - name: Checkout repository
@@ -90,14 +86,30 @@ jobs:
           cd ..
 
       # ------------------------------------------------------------------
-      # KernelSU-Next LEGACY branch (v3.3.0+): correct for 4.14 non-GKI and
-      # contains kernel/feature/selinux_hide.c. The `legacy` positional arg
-      # makes setup.sh `git checkout legacy` inside the KernelSU-Next clone.
-      # This ALSO symlinks drivers/kernelsu -> KernelSU-Next/kernel and edits
-      # drivers/Makefile + drivers/Kconfig automatically, so it MUST run
-      # BEFORE the SUSFS patch steps below.
+      # KernelSU-Next `legacy` branch (MODULAR kernel/ layout: kernel/core/,
+      # kernel/feature/, kernel/hook/).
+      #
+      # WHY legacy (modular) and NOT v1.0.6 (flat) or susfs: this variant
+      # deliberately drops SUSFS entirely. The only reason the earlier build
+      # pinned v1.0.6 was to satisfy susfs4ksu's 10_enable_susfs_for_ksu.patch,
+      # which diffs the flat tree and DEFINES the bridge symbols
+      # (susfs_is_current_ksu_domain, susfs_is_current_zygote_domain,
+      # susfs_try_umount_all, ksu_try_umount, ksu_input_hook) that the 50-patch's
+      # fs/ code references. On the modular tree the 10-patch cannot apply, so
+      # those symbols stay undefined -> ld.lld "undefined symbol". With NO susfs
+      # here, the 50-patch fs/ code is never added, so nothing references those
+      # bridge symbols and the build LINKS.
+      #
+      # selinux_hide: the standalone kernel/feature/selinux_hide.c (fake SELinux
+      # status page + patched /sys/fs/selinux/status fops, avc kprobe) exists
+      # ONLY in the modular tree and is independent of susfs, so it compiles and
+      # links on its own. We assert it is present below.
+      #
+      # setup.sh does `git checkout legacy`; it symlinks
+      # drivers/kernelsu -> KernelSU-Next/kernel and edits drivers/Makefile +
+      # drivers/Kconfig automatically.
       # ------------------------------------------------------------------
-      - name: KernelSU-Next setup (legacy)
+      - name: KernelSU-Next setup (legacy modular)
         working-directory: ./kernel
         run: |
           export PATH=/usr/lib/llvm-18/bin:$PATH
@@ -106,143 +118,10 @@ jobs:
           if [ -d KernelSU-Next ]; then
             git -C KernelSU-Next log -1 --oneline || true
           fi
-          echo "==== confirm selinux_hide.c present ===="
-          test -f KernelSU-Next/kernel/feature/selinux_hide.c
-          echo "selinux_hide.c OK"
-
-      # ------------------------------------------------------------------
-      # SUSFS (kernel-4.14) integration.
-      #
-      # Only the kernel-side patch (50_add_susfs_in_kernel-4.14.patch) is
-      # applied. The KernelSU-side patch (10_enable_susfs_for_ksu.patch) is
-      # DELIBERATELY NOT applied: it targets the classic flat tiann/KernelSU
-      # kernel/ layout (kernel/core_hook.c, kernel/ksud.c, kernel/allowlist.c,
-      # kernel/throne_tracker.c, ...). The KernelSU-Next *legacy* branch used
-      # here has a refactored layout (kernel/core/, kernel/feature/,
-      # kernel/hook/, ...) where 16 of the 18 files the 10-patch touches do not
-      # exist, so it can only ever "can't find file to patch" / .rej. See the
-      # separate "Enable KSU_SUSFS Kconfig..." step which injects just the
-      # Kconfig symbols the 50-patch #ifdef guards need.
-      # ------------------------------------------------------------------
-      - name: Clone SUSFS
-        run: |
-          git clone --depth=1 --branch "${SUSFS_BRANCH}" "${SUSFS_SOURCE}" susfs4ksu
-
-      - name: Apply SUSFS patches (kernel-4.14)
-        working-directory: ./kernel
-        run: |
-          set -euo pipefail
-          # 1) Copy SUSFS sources into the kernel tree
-          #    (include/linux/susfs_def.h defines INODE_STATE_SUS_KSTAT = BIT(26))
-          cp ../susfs4ksu/kernel_patches/fs/* fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-          test -f include/linux/susfs_def.h || { echo "FATAL: susfs_def.h missing after copy"; exit 1; }
-          grep -q 'INODE_STATE_SUS_KSTAT' include/linux/susfs_def.h \
-            || { echo "FATAL: INODE_STATE_SUS_KSTAT not defined in susfs_def.h"; exit 1; }
-
-          # 2) Apply the main kernel-side SUSFS patch.
-          #    NOTE: hunk #1 of the fs/proc/task_mmu.c diff (the
-          #    '#include <linux/susfs_def.h>' block near line 19) FAILS on
-          #    lineage-22.1 because LineageOS added '#include <linux/ctype.h>'
-          #    right after '#include <linux/mm_inline.h>', which perturbs the
-          #    trailing context the hunk needs. Hunks #2/#3 (which reference
-          #    INODE_STATE_SUS_KSTAT) still apply, so without the include the
-          #    build fails with "use of undeclared identifier
-          #    'INODE_STATE_SUS_KSTAT'". We let patch run, then repair the one
-          #    missing include manually just below (idempotent, grep-guarded).
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${SUSFS_KVER}.patch ./
-          patch -p1 < 50_add_susfs_in_kernel-${SUSFS_KVER}.patch || true
-
-          # 3) Repair the failed task_mmu.c hunk #1: inject the susfs_def.h
-          #    include after <linux/mm_inline.h> if it is not already present.
-          #    This is the exact intent of the rejected hunk and makes
-          #    INODE_STATE_SUS_KSTAT visible to fs/proc/task_mmu.c.
-          if ! grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c; then
-            sed -i '/#include <linux\/mm_inline.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux\/susfs_def.h>\n#endif' fs/proc/task_mmu.c
-            echo "[susfs] injected susfs_def.h include into fs/proc/task_mmu.c"
-          else
-            echo "[susfs] susfs_def.h already included in fs/proc/task_mmu.c"
-          fi
-          # Hard gate: the include MUST be present now, or the build will fail
-          # the same way. Fail loudly here instead of 30 min into the compile.
-          grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c \
-            || { echo "FATAL: susfs_def.h include still missing from task_mmu.c"; exit 1; }
-          echo "==== task_mmu.c include region ===="
-          sed -n '19,26p' fs/proc/task_mmu.c
-
-      # ------------------------------------------------------------------
-      # KSU_SUSFS Kconfig symbols. The 50-patch guards every SUSFS code path
-      # with #ifdef CONFIG_KSU_SUSFS_SUS_* . On the classic layout those
-      # symbols come from 10_enable_susfs_for_ksu.patch, which we do NOT apply
-      # (incompatible layout, see above). We add just the Kconfig menu to the
-      # KernelSU-Next legacy kernel/Kconfig so CONFIG_KSU_SUSFS and its
-      # sub-options exist and can be turned on by the defconfig fragment.
-      # Idempotent: only appended if KSU_SUSFS is not already declared.
-      # ------------------------------------------------------------------
-      - name: Enable KSU_SUSFS Kconfig (legacy layout)
-        working-directory: ./kernel
-        run: |
-          set -euo pipefail
-          KSU_KCFG="KernelSU-Next/kernel/Kconfig"
-          test -f "${KSU_KCFG}" || { echo "FATAL: ${KSU_KCFG} not found"; exit 1; }
-          if grep -q 'config KSU_SUSFS' "${KSU_KCFG}"; then
-            echo "[susfs] KSU_SUSFS Kconfig already present; skipping"
-          else
-            # Append a self-contained SUSFS Kconfig menu at EOF. It sits after
-            # the "KernelSU" menu's endmenu (own menu, own endmenu) which is
-            # valid Kconfig; only symbol existence matters for the 50-patch
-            # #ifdef guards. Written column-0 via a quoted heredoc so Kconfig
-            # `config`/`menu` keywords are not indented.
-            cat >> "${KSU_KCFG}" <<'KCFG'
-
-          menu "KernelSU - SUSFS"
-
-          config KSU_SUSFS
-          	bool "KernelSU addon - SUSFS"
-          	depends on KSU
-          	default y
-
-          config KSU_SUSFS_SUS_PATH
-          	bool "Enable to hide suspicious path"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_SUS_MOUNT
-          	bool "Enable to hide suspicious mounts"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_SUS_KSTAT
-          	bool "Enable to spoof suspicious kstat"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_TRY_UMOUNT
-          	bool "Enable try_umount"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_SPOOF_UNAME
-          	bool "Enable to spoof uname"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_ENABLE_LOG
-          	bool "Enable susfs kernel logging"
-          	depends on KSU_SUSFS
-          	default y
-
-          config KSU_SUSFS_OPEN_REDIRECT
-          	bool "Enable open redirect"
-          	depends on KSU_SUSFS
-          	default y
-
-          endmenu
-          KCFG
-            echo "[susfs] appended KSU_SUSFS Kconfig menu"
-          fi
-          echo "==== KSU_SUSFS Kconfig symbols ===="
-          grep -n 'config KSU_SUSFS' "${KSU_KCFG}" || true
+          echo "==== confirm MODULAR layout + selinux_hide.c present ===="
+          test -f KernelSU-Next/kernel/feature/selinux_hide.c \
+            || { echo "FATAL: kernel/feature/selinux_hide.c missing (not the legacy modular tree?)"; exit 1; }
+          echo "modular KSU-Next tree OK: selinux_hide.c present"
 
       # Patch 1: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) via pattern (idempotent)
       - name: Apply hugetlbpage fix patch
@@ -271,27 +150,29 @@ jobs:
           sed -i 's/split_huge_pmd(vma, addr, pmd);/split_huge_pmd(vma, pmd, addr);/' fs/proc/task_mmu.c || true
 
       # ------------------------------------------------------------------
-      # Inject KSU / SUSFS / selinux_hide / vermagic config into the defconfig
+      # Inject KSU / selinux_hide / vermagic config into the defconfig
       # BEFORE seeding .config so olddefconfig keeps them. This is the block
-      # that preserves the WiFi vermagic and enables the selinux_hide toggle.
+      # that preserves the WiFi vermagic. NO susfs symbols here.
       # ------------------------------------------------------------------
-      - name: Inject KSU + SUSFS + vermagic defconfig fragment
+      - name: Inject KSU + vermagic defconfig fragment
         working-directory: kernel
         run: |
           set -euo pipefail
           DEFCFG="arch/arm64/configs/${KERNEL_DEFCONFIG}"
           echo "Appending config fragment to ${DEFCFG}"
           cat >> "${DEFCFG}" <<'EOF'
-          # --- KernelSU-Next (legacy) + SUSFS + selinux_hide ---
-          # legacy branch needs hooks: enable KPROBES so KSU uses kprobes syscall
-          # hooks (no manual source patch) + full selinux_hide (incl. avc kprobe).
-          # Manual hook must be OFF (KSU_KPROBES_HOOK depends on !KSU_MANUAL_HOOK).
+          # --- KernelSU-Next (legacy modular), NO susfs ---
+          # The legacy modular hook model uses CONFIG_KSU_KPROBES_HOOK (deps
+          # KPROBES + KRETPROBES + HAVE_SYSCALL_TRACEPOINTS). A freshly-cloned
+          # LineageOS kernel has no manual-hook integration, so MANUAL_HOOK is
+          # left OFF and the kprobes hook is used instead - this also satisfies
+          # selinux_hide's avc kprobe. Enable KPROBES + KALLSYMS_ALL so the
+          # kprobe syscall hooks resolve at runtime.
           CONFIG_KPROBES=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-          # CONFIG_KSU_MANUAL_HOOK is not set
           CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
+          # CONFIG_KSU_MANUAL_HOOK is not set
           CONFIG_KSU_KPROBES_HOOK=y
           # --- Preserve WiFi vermagic: 4.14.356-perf-g040f6e737afe SMP preempt mod_unload modversions aarch64 ---
           CONFIG_LOCALVERSION="-perf-g040f6e737afe"
@@ -354,9 +235,7 @@ jobs:
           CONFIG_KPROBES=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-          CONFIG_KSU_MANUAL_HOOK=n
           CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
           CONFIG_KSU_KPROBES_HOOK=y
           CONFIG_KERNEL_GZIP=y
           CONFIG_KERNEL_BZIP2=n
@@ -384,8 +263,8 @@ jobs:
               --set-str CONFIG_LOCALVERSION "-perf-g040f6e737afe" --disable CONFIG_LOCALVERSION_AUTO \
               --enable CONFIG_MODVERSIONS --enable CONFIG_MODULE_UNLOAD \
               --enable CONFIG_SMP --enable CONFIG_PREEMPT \
-              --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS_ALL --disable CONFIG_KSU_MANUAL_HOOK \
-              --enable CONFIG_KSU --enable CONFIG_KSU_SUSFS --enable CONFIG_KSU_KPROBES_HOOK \
+              --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS_ALL \
+              --enable CONFIG_KSU --disable CONFIG_KSU_MANUAL_HOOK --enable CONFIG_KSU_KPROBES_HOOK \
               --enable CONFIG_KERNEL_GZIP \
               --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
@@ -423,14 +302,20 @@ jobs:
             sed -i "s/^${e}=.*/${e}=y/" out/.config
             grep -q "^${e}=y" out/.config || echo "${e}=y" >> out/.config
           done
-          # Disable manual hook, then force KPROBES / KALLSYMS_ALL / KSU / SUSFS / kprobes-hook =y
-          sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
-          for e in CONFIG_KPROBES CONFIG_KALLSYMS_ALL CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_KPROBES_HOOK; do
+          # Force KPROBES / KALLSYMS_ALL / KSU / KSU_KPROBES_HOOK =y.
+          # (legacy modular uses CONFIG_KSU_KPROBES_HOOK for its hook model; deps
+          # KPROBES+KRETPROBES+HAVE_SYSCALL_TRACEPOINTS are satisfied. MANUAL_HOOK
+          # is forced OFF - see below - since a fresh LineageOS tree has no manual
+          # hook integration.)
+          for e in CONFIG_KPROBES CONFIG_KALLSYMS_ALL CONFIG_KSU CONFIG_KSU_KPROBES_HOOK; do
             sed -i "s/^# ${e} is not set/${e}=y/" out/.config
             sed -i "s/^${e}=.*/${e}=y/" out/.config
             grep -q "^${e}=y" out/.config || echo "${e}=y" >> out/.config
           done
-          # re-resolve so KSU_KPROBES_HOOK dep chain settles, then verify below
+          # Force MANUAL_HOOK OFF (fresh tree has no manual hooks -> "No hooks
+          # were defined" if this is on without the kprobes hook).
+          sed -i 's/^CONFIG_KSU_MANUAL_HOOK=.*/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
+          # re-resolve so the KSU dep chain settles, then verify below
           make O=out ARCH=arm64 olddefconfig
 
           # Re-resolve dependencies non-interactively and write auto.conf
@@ -439,8 +324,8 @@ jobs:
           echo "==== Key config lines ===="
           egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_NFS_FS|CONFIG_KERNEL_GZIP)=' out/.config || true
           echo "==== Vermagic + KSU config verification ===="
-          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_SMP=|CONFIG_PREEMPT=|CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_KPROBES_HOOK=)' out/.config || true
-          grep -E 'CONFIG_LOCALVERSION_AUTO' out/.config || true
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_SMP=|CONFIG_PREEMPT=|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_KSU_KPROBES_HOOK=)' out/.config || true
+          grep -E 'CONFIG_LOCALVERSION_AUTO|CONFIG_KSU_MANUAL_HOOK' out/.config || true
 
       # 2b) Hard gate: fail early if vermagic-critical config drifted
       - name: Verify vermagic-critical config
@@ -449,7 +334,7 @@ jobs:
           set -euo pipefail
           grep -q '^CONFIG_LOCALVERSION="-perf-g040f6e737afe"' out/.config || { echo "FATAL: CONFIG_LOCALVERSION wrong"; exit 1; }
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' out/.config || { echo "FATAL: LOCALVERSION_AUTO still enabled"; exit 1; }
-          for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_SMP CONFIG_PREEMPT CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KPROBES CONFIG_KSU_KPROBES_HOOK; do
+          for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_SMP CONFIG_PREEMPT CONFIG_KSU CONFIG_KPROBES CONFIG_KSU_KPROBES_HOOK; do
             grep -q "^${e}=y" out/.config || { echo "FATAL: ${e} not =y"; exit 1; }
           done
           echo "Vermagic + KSU config OK"
