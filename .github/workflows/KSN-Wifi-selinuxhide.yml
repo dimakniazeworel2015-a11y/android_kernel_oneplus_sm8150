@@ -413,6 +413,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export KBUILD_BUILD_TIMESTAMP="Fri Sep 5 17:27:46 UTC 2025"
           make ARCH=arm64 O=out LLVM=1 LLVM_IAS=0 CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             scripts prepare
@@ -424,6 +425,12 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           export KBUILD_BUILD_USER=ci
           export KBUILD_BUILD_HOST=github
+          # KERNELCHECK FIX: set kernel build timestamp to MATCH the device system
+          # build date (ro.build.date = "Fri Sep  5 17:27:46 PKT 2025"). The Shield
+          # checker flags "build time drift" when uname date != system date. Matching
+          # them makes drift = 0. NOTE: the timestamp is NOT part of vermagic, so the
+          # existing wlan.ko stays compatible (WiFi unaffected).
+          export KBUILD_BUILD_TIMESTAMP="Fri Sep 5 17:27:46 UTC 2025"
 
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
