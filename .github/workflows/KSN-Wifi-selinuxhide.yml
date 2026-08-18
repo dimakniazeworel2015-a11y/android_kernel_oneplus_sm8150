@@ -1,22 +1,31 @@
-name: Build kernel (KSN FLAT v1.0.6 + SUSFS + manual hooks + selinux_hide) & WIFI
+name: Build kernel (KSN FLAT v1.0.6 + manual hooks + selinux_hide, NO SUSFS) & WIFI
 
 # =====================================================================
 # BOOTABLE rebuild for OnePlus 7T "hotdogb" (SM8150), crDroid 15 / A15.
 #
-# STRATEGY CHANGE — replicate the device's PROVEN-BOOTING KernelSU setup.
+# STRATEGY CHANGE — replicate the device's PROVEN-BOOTING KernelSU setup,
+# but DROP SUSFS entirely for this boot-test.
 #
 # THREE prior builds used KernelSU-Next LEGACY MODULAR + KPROBES and all
 # HANG at early boot (black screen after logo, no pstore log). A build with
 # selinux_hide DISABLED still hung -> the killer is the modular-KSU+KPROBES
 # combination (and/or a dtb/dtbo mismatch), NOT selinux_hide.
 #
+# WHY NO SUSFS HERE: the susfs4ksu 10_enable_susfs_for_ksu.patch does NOT
+# apply cleanly to KSU-Next v1.0.6's FLAT tree (hunk failures in
+# kernel/Makefile, kernel/apk_sign.c, kernel/core_hook.c — the patch targets
+# tiann/KernelSU, and KSU-Next v1.0.6 differs). susfs is a persistent blocker.
+# We drop it to test empirically whether a FLAT KSU-Next v1.0.6 + manual-hooks
+# + selinux_hide kernel BOOTS. Play Integrity STRONG will be tested at runtime
+# (tricky_store may carry STRONG without susfs).
+#
 # The device's currently-BOOTING kernel (from /proc/config.gz, committed as
 # device_config) is:
-#   * CONFIG_KSU=y + CONFIG_KSU_SUSFS=y + all CONFIG_KSU_SUSFS_*   -> FLAT KSU + SUSFS
+#   * CONFIG_KSU=y (+ SUSFS on device)                            -> FLAT KSU
 #   * "# CONFIG_KPROBES is not set"                                -> MANUAL hooks
 #   * CONFIG_LTO_CLANG=y, base 4.14.356
-# So the booting recipe = FLAT KernelSU-Next v1.0.6 + SUSFS + MANUAL syscall
-# hooks + NO kprobes. This workflow reproduces exactly that, and adds a
+# So the booting recipe = FLAT KernelSU-Next v1.0.6 + MANUAL syscall hooks +
+# NO kprobes. This workflow reproduces that (minus susfs), and adds a
 # POST-BOOT-deferred selinux_hide (never runs during early init).
 #
 # KEY IMPLEMENTATION FACTS (verified against the KernelSU-Next v1.0.6 tree):
@@ -64,7 +73,7 @@ on:
       output_name:
         description: 'Name of the output.zip'
         required: false
-        default: 'OP7_KSN_flat_susfs_selinuxhide_wifi'
+        default: 'OP7_KSN_flat_nosusfs_selinuxhide_wifi'
 
 jobs:
   build:
@@ -77,10 +86,8 @@ jobs:
       KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'hotdogb_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_flat_susfs_selinuxhide_wifi' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_flat_nosusfs_selinuxhide_wifi' }}
       KSU_TAG: "v1.0.6"
-      SUSFS_REPO: "https://github.com/kutemeikito/susfs4ksu"
-      SUSFS_BRANCH: "kernel-4.14"
 
     steps:
       - name: Checkout repository (holds device_config + selinux_hide port)
@@ -107,7 +114,11 @@ jobs:
       - name: Install dependencies + apt clang-18 (proven to build this 4.14 tree)
         run: |
           set -euo pipefail
-          sudo apt-get update -y
+          # The azure apt mirror has hung 60+ min twice; wrap update in a
+          # bounded retry+timeout so a flaky mirror can't stall the whole build.
+          for i in 1 2 3 4 5; do
+            sudo timeout 120 apt-get update && break || { echo "apt-get update attempt $i failed; retrying"; sleep 15; }
+          done
           sudo apt-get install -y \
             clang-18 lld-18 llvm-18 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
@@ -161,45 +172,13 @@ jobs:
           ls -l drivers/kernelsu || true
 
       # ------------------------------------------------------------------
-      # SUSFS (keep it — preserves the device's hiding + Play Integrity STRONG).
-      # susfs4ksu kernel-4.14: apply the kernel-side 50_ patch at kernel root,
-      # then the KSU-side 10_ bridge inside KernelSU-Next/. Both apply to the
-      # flat v1.0.6 tree (18 target files all present; Kconfig symbols match
-      # device_config exactly: HAS_MAGIC_MOUNT/SUS_PATH/SUS_MOUNT/SPOOF_UNAME/
-      # OPEN_REDIRECT/...).
+      # NO SUSFS. The susfs4ksu 10_enable_susfs_for_ksu.patch does not apply to
+      # the FLAT KSU-Next v1.0.6 tree (it targets tiann/KernelSU). susfs is a
+      # persistent blocker, so it is dropped entirely for this boot-test build.
+      # We strip every CONFIG_KSU_SUSFS* symbol from the base config below so
+      # olddefconfig resolves cleanly without the susfs patch. The selinux_hide
+      # port compiles standalone (no susfs headers/symbols).
       # ------------------------------------------------------------------
-      - name: Apply SUSFS (kernel 50_ patch + KSU 10_ bridge)
-        working-directory: ./kernel
-        run: |
-          set -euo pipefail
-          git clone --depth=1 --branch "${SUSFS_BRANCH}" "${SUSFS_REPO}" ../susfs4ksu
-          KP="../susfs4ksu/kernel_patches"
-          test -f "${KP}/50_add_susfs_in_kernel-4.14.patch" || { echo "FATAL: 50_ susfs patch missing"; exit 1; }
-          test -f "${KP}/KernelSU/10_enable_susfs_for_ksu.patch" || { echo "FATAL: 10_ susfs bridge missing"; exit 1; }
-
-          echo "==== copy susfs kernel-side sources (fs/ include/) ===="
-          cp -v "${KP}/fs/"* fs/ 2>/dev/null || true
-          cp -v "${KP}/include/linux/"* include/linux/ 2>/dev/null || true
-
-          echo "==== apply kernel-side 50_ susfs patch at kernel root ===="
-          # task_mmu.c hunk #1 (the <linux/susfs_def.h> include) fails on lineage
-          # because an added <linux/ctype.h> after <linux/mm_inline.h> perturbs it;
-          # let patch continue (|| true), then repair the missing include below.
-          patch -p1 --no-backup-if-mismatch < "${KP}/50_add_susfs_in_kernel-4.14.patch" || true
-          if ! grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c; then
-            sed -i '/#include <linux\/mm_inline.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux\/susfs_def.h>\n#endif' fs/proc/task_mmu.c
-          fi
-          grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c \
-            || { echo "FATAL: task_mmu susfs_def include not injected"; exit 1; }
-          echo "task_mmu.c susfs_def include OK"
-
-          echo "==== apply KSU-side 10_ bridge inside KernelSU-Next/ ===="
-          cp "${KP}/KernelSU/10_enable_susfs_for_ksu.patch" KernelSU-Next/
-          ( cd KernelSU-Next && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
-
-          echo "==== susfs sanity: susfs Kconfig symbols now present in KSU Kconfig ===="
-          grep -q 'KSU_SUSFS' KernelSU-Next/kernel/Kconfig || { echo "FATAL: susfs Kconfig bridge not applied"; exit 1; }
-          echo "susfs applied OK"
 
       # ------------------------------------------------------------------
       # MANUAL SYSCALL HOOKS (non-GKI integration) — lineage-23.0 lacks them.
@@ -273,8 +252,11 @@ jobs:
 
       # ------------------------------------------------------------------
       # Install the device's real config as the build base defconfig and
-      # transform it to MATCH the device's booting KSU setup:
-      #   * KEEP CONFIG_KSU=y and ALL CONFIG_KSU_SUSFS* (device has them)
+      # transform it to MATCH the device's booting KSU setup, MINUS susfs:
+      #   * KEEP CONFIG_KSU=y
+      #   * DROP every CONFIG_KSU_SUSFS* symbol (no susfs patch this build; if
+      #     left in, olddefconfig would choke on symbols that no longer exist).
+      #     We delete all sub-options and add "# CONFIG_KSU_SUSFS is not set".
       #   * KEEP "# CONFIG_KPROBES is not set"  (MANUAL hooks like the device)
       #   * add "# CONFIG_KSU_WITH_KPROBES is not set" (v1.0.6 manual-mode switch)
       #   * KEEP PSTORE/PSTORE_CONSOLE/PSTORE_RAM/PSTORE_PMSG =y (hang capture)
@@ -284,7 +266,7 @@ jobs:
       #   * DT overlay OFF (broken .dtbo compile; appended dtb unaffected)
       # Everything else in the device config is preserved untouched.
       # ------------------------------------------------------------------
-      - name: Install device config as base defconfig (match device KSU setup)
+      - name: Install device config as base defconfig (match device KSU setup, NO susfs)
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -293,7 +275,16 @@ jobs:
           test -f "$SRC" || { echo "FATAL: device_config not found at $SRC"; exit 1; }
           cp "$SRC" "$DST"
 
-          echo "==== apply KSN-flat/manual/vermagic/LTO deltas (keep susfs + kprobes-off) ===="
+          echo "==== drop ALL susfs symbols from base config (no susfs patch this build) ===="
+          # Remove every CONFIG_KSU_SUSFS* line (both '=...' and '# ... is not set'
+          # forms). Without the susfs patch these Kconfig symbols do not exist, so
+          # leaving them in would make olddefconfig warn/drop them noisily; strip
+          # them up-front so the resolve is clean.
+          sed -i '/^CONFIG_KSU_SUSFS/d;/^# CONFIG_KSU_SUSFS.* is not set$/d' "$DST"
+          if grep -q '^CONFIG_KSU_SUSFS' "$DST"; then echo "FATAL: susfs symbol survived strip"; exit 1; fi
+          echo "susfs symbols stripped from base config OK"
+
+          echo "==== apply KSN-flat/manual/vermagic/LTO deltas (susfs OFF, kprobes-off) ===="
           drop() { sed -i "/^${1}=/d;/^# ${1} is not set$/d" "$DST"; }
           for s in CONFIG_KPROBES CONFIG_KRETPROBES \
                    CONFIG_KSU_WITH_KPROBES CONFIG_KSU_KPROBES_HOOK CONFIG_KSU_MANUAL_HOOK \
@@ -310,6 +301,8 @@ jobs:
           # CONFIG_KPROBES is not set
           # CONFIG_KSU_WITH_KPROBES is not set
           CONFIG_KSU=y
+          # --- SUSFS DROPPED for this boot-test (patch fails on flat v1.0.6) ---
+          # CONFIG_KSU_SUSFS is not set
           # --- vermagic base: 4.14.356-perf (device: -perf, AUTO adds git sha off) ---
           CONFIG_LOCALVERSION="-perf"
           # CONFIG_LOCALVERSION_AUTO is not set
@@ -330,8 +323,9 @@ jobs:
           CONFIG_PSTORE_PMSG=y
           CONFIG_PSTORE_RAM=y
           EOF
-          echo "==== assert susfs symbols are PRESERVED (device ships them) ===="
-          grep -q '^CONFIG_KSU_SUSFS=y' "$DST" || { echo "FATAL: CONFIG_KSU_SUSFS dropped (must keep)"; exit 1; }
+          echo "==== assert NO susfs symbols remain (susfs dropped this build) ===="
+          if grep -q '^CONFIG_KSU_SUSFS=y' "$DST"; then echo "FATAL: CONFIG_KSU_SUSFS=y present (must be dropped)"; exit 1; fi
+          grep -q '^# CONFIG_KSU_SUSFS is not set' "$DST" || { echo "FATAL: '# CONFIG_KSU_SUSFS is not set' missing"; exit 1; }
           echo "==== tail of transformed defconfig ===="
           tail -n 40 "$DST"
 
@@ -379,8 +373,14 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
 
+          # susfs is dropped this build: the Kconfig symbols do not exist without
+          # the patch, so olddefconfig cannot enable them. Assert none crept back.
+          if grep -q '^CONFIG_KSU_SUSFS=y' "$C"; then echo "FATAL: CONFIG_KSU_SUSFS reappeared (susfs must stay off)"; exit 1; fi
+
           echo "==== key config after finalize ===="
-          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_PSTORE=|CONFIG_PSTORE_RAM=)' "$C" || true
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_PSTORE=|CONFIG_PSTORE_RAM=)' "$C" || true
+          echo "==== susfs must be absent/off ===="
+          grep -E 'CONFIG_KSU_SUSFS' "$C" || echo "(no CONFIG_KSU_SUSFS symbols — susfs dropped, as intended)"
           echo "==== these MUST be off (manual hooks) ===="
           grep -E 'CONFIG_KPROBES|CONFIG_KSU_WITH_KPROBES|CONFIG_LTO_CLANG|CONFIG_LOCALVERSION_AUTO' "$C" || true
 
@@ -394,9 +394,9 @@ jobs:
           # MANUAL hooks: KPROBES + WITH_KPROBES must be OFF (this is the device's setup)
           grep -q '^# CONFIG_KPROBES is not set' "$C" || { echo "FATAL: KPROBES on (must be off for manual hooks)"; exit 1; }
           if grep -q '^CONFIG_KSU_WITH_KPROBES=y' "$C"; then echo "FATAL: KSU_WITH_KPROBES on (must be off)"; exit 1; fi
-          # KSU + susfs must be present (device ships them)
+          # KSU must be present; susfs must be OFF (dropped this build)
           grep -q '^CONFIG_KSU=y' "$C" || { echo "FATAL: CONFIG_KSU not =y"; exit 1; }
-          grep -q '^CONFIG_KSU_SUSFS=y' "$C" || { echo "FATAL: CONFIG_KSU_SUSFS not =y (device ships susfs)"; exit 1; }
+          if grep -q '^CONFIG_KSU_SUSFS=y' "$C"; then echo "FATAL: CONFIG_KSU_SUSFS on (susfs must be dropped this build)"; exit 1; fi
           # device options that must survive
           for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_TASKSTATS CONFIG_KALLSYMS_ALL \
                    CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_RAM; do
@@ -406,7 +406,7 @@ jobs:
           if grep -q '^CONFIG_LTO_CLANG=y' "$C"; then echo "FATAL: LTO_CLANG on (must be off)"; exit 1; fi
           # DT overlay off (broken .dtbo compile)
           if grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' "$C"; then echo "FATAL: DT_OVERLAY on"; exit 1; fi
-          echo "Boot/vermagic/KSU config gate OK (FLAT KSU + susfs + manual hooks + pstore, LTO off, overlay off)"
+          echo "Boot/vermagic/KSU config gate OK (FLAT KSU, NO susfs, manual hooks + pstore, LTO off, overlay off)"
 
       - name: Prepare scripts and headers
         working-directory: ./kernel
@@ -428,9 +428,10 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
 
-          for s in CONFIG_TASKSTATS CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_PSTORE_RAM; do
+          for s in CONFIG_TASKSTATS CONFIG_KSU CONFIG_PSTORE_RAM; do
             grep -q "^${s}=y" out/.config || echo "WARN: ${s} not =y"
           done
+          if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then echo "WARN: CONFIG_KSU_SUSFS=y (susfs should be dropped)"; fi
           grep -q '^# CONFIG_LTO_CLANG is not set' out/.config && echo "LTO off (as intended)" || echo "WARN: LTO not explicitly off"
 
           make -j"$(nproc)" ARCH=arm64 O=out LLVM=1 LLVM_IAS=0 \
