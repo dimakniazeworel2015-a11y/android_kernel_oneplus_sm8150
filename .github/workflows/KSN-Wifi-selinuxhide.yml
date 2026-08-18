@@ -160,6 +160,123 @@ jobs:
           echo "ksu_input_hook def:"; grep -n 'ksu_input_hook' "$F" \
             || { echo "FATAL: ksu_input_hook not defined"; exit 1; }
 
+
+      # ------------------------------------------------------------------
+      # selinux_hide: DEFAULT-DISABLED at boot (idempotent, grep-guarded).
+      #
+      # WHY: two prior builds black-screened (hang, no pstore/ramoops panic)
+      # right after the OEM logo. Root cause = selinux_hide auto-enabling at
+      # boot. kernel/feature/selinux_hide.c ships the enable flag defaulted
+      # to TRUE, and ksu_hide_init_thread() runs initialize_fake_status() +
+      # hook_selinux_status_open() UNCONDITIONALLY (the fops-patch of
+      # /sys/fs/selinux/status via vmap + irq-disable) very early -> hang.
+      #
+      # The device's KSU-Next v3.3.0 manager has a runtime selinux_hide
+      # toggle, so selinux_hide is meant to be turned ON from userspace AFTER
+      # boot, not auto-on at boot. This step makes it default-OFF:
+      #   1. flag default TRUE -> FALSE.
+      #   2. ksu_hide_init_thread(): early-return unless the flag is already
+      #      set, so NOTHING (enable, fake status, fops hook) runs at boot.
+      #   3. runtime toggle (selinux_hide_status_feature_set) now performs the
+      #      FULL activation itself (enable + initialize_fake_status +
+      #      hook_selinux_status_open) on ON, and unhook on OFF, because the
+      #      boot thread no longer auto-hooks. ksu_selinux_hide_enable() is
+      #      NOT removed -- only stopped from running automatically at boot.
+      # ------------------------------------------------------------------
+      - name: selinux_hide default-disabled at boot (no auto-enable)
+        working-directory: ./kernel
+        run: |
+          set -euo pipefail
+          F=KernelSU-Next/kernel/feature/selinux_hide.c
+          test -f "$F" || { echo "FATAL: $F missing (KSU-Next legacy selinux_hide absent)"; exit 1; }
+
+          echo "==== selinux_hide flag BEFORE ===="
+          grep -n 'ksu_selinux_hide_is_enabled __read_mostly' "$F" || true
+
+          python3 - "$F" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p, "r", newline="").read()
+
+          # ---- EDIT 1: default flag TRUE -> FALSE ----
+          if "ksu_selinux_hide_is_enabled __read_mostly = true;" in s:
+              s = s.replace(
+                  "// enabled by default\nstatic bool ksu_selinux_hide_is_enabled __read_mostly = true;",
+                  "// DISABLED by default at boot (CI patch): only the userspace manager toggle enables it\nstatic bool ksu_selinux_hide_is_enabled __read_mostly = false;",
+                  1,
+              )
+              print("[edit1] flag default true -> false")
+          elif "ksu_selinux_hide_is_enabled __read_mostly = false;" in s:
+              print("[edit1] flag already false (idempotent) -- ok")
+          else:
+              sys.exit("[edit1] FATAL: enable-flag declaration not found (upstream changed)")
+
+          # ---- EDIT 2: early-return guard in ksu_hide_init_thread ----
+          guard = (
+              "\twhile (READ_ONCE(ksu_input_hook))\n\t\tmsleep(5000);\n\n"
+              "\tif (ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_enable();"
+          )
+          if "CI patch: do nothing at boot" in s:
+              print("[edit2] init-thread guard already present (idempotent) -- ok")
+          elif guard in s:
+              repl = (
+                  "\twhile (READ_ONCE(ksu_input_hook))\n\t\tmsleep(5000);\n\n"
+                  "\t/* CI patch: do nothing at boot unless already enabled (default is now\n"
+                  "\t * false). selinux_hide is meant to be turned on from the userspace\n"
+                  "\t * manager toggle post-boot; auto-hooking the sel status fops this early\n"
+                  "\t * hangs the device. */\n"
+                  "\tif (!READ_ONCE(ksu_selinux_hide_is_enabled))\n\t\treturn 0;\n\n"
+                  "\tif (ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_enable();"
+              )
+              s = s.replace(guard, repl, 1)
+              print("[edit2] init-thread early-return guard inserted")
+          else:
+              sys.exit("[edit2] FATAL: ksu_hide_init_thread anchor not found (upstream changed)")
+
+          # ---- EDIT 3: runtime toggle performs full activation (fops hook) ----
+          setter_old = (
+              "\tif (!ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_disable();\n"
+              "\telse\n\t\tksu_selinux_hide_enable();"
+          )
+          if "CI patch: runtime toggle now installs/removes" in s:
+              print("[edit3] setter full-activation already present (idempotent) -- ok")
+          elif setter_old in s:
+              setter_new = (
+                  "\t/* CI patch: runtime toggle now installs/removes the sel-status fops\n"
+                  "\t * hook itself, because ksu_hide_init_thread no longer auto-hooks at\n"
+                  "\t * boot. Enable path mirrors the old boot-thread tail. */\n"
+                  "\tif (!ksu_selinux_hide_is_enabled) {\n"
+                  "\t\tunhook_selinux_status_open();\n"
+                  "\t\tksu_selinux_hide_disable();\n"
+                  "\t} else {\n"
+                  "\t\tksu_selinux_hide_enable();\n"
+                  "\t\tinitialize_fake_status();\n"
+                  "\t\tif (READ_ONCE(fake_status))\n"
+                  "\t\t\thook_selinux_status_open();\n"
+                  "\t}"
+              )
+              s = s.replace(setter_old, setter_new, 1)
+              print("[edit3] runtime setter full-activation applied")
+          else:
+              sys.exit("[edit3] FATAL: selinux_hide_status_feature_set anchor not found (upstream changed)")
+
+          open(p, "w", newline="").write(s)
+          print("[selinux_hide] wrote", p)
+          PYEOF
+
+          echo "==== selinux_hide flag AFTER (must be = false) ===="
+          grep -n 'ksu_selinux_hide_is_enabled __read_mostly' "$F"
+          grep -q 'ksu_selinux_hide_is_enabled __read_mostly = false;' "$F" \
+            || { echo "FATAL: flag not defaulted to false"; exit 1; }
+          echo "==== ksu_hide_init_thread guard AFTER (must early-return on !enabled) ===="
+          awk '/^static int ksu_hide_init_thread/{f=1} f{print} /^}/{if(f)exit}' "$F"
+          grep -q 'if (!READ_ONCE(ksu_selinux_hide_is_enabled))' "$F" \
+            || { echo "FATAL: boot early-return guard missing"; exit 1; }
+          echo "==== runtime setter AFTER (must call hook_selinux_status_open) ===="
+          awk '/^static int selinux_hide_status_feature_set/{f=1} f{print} /^}/{if(f)exit}' "$F"
+          grep -q 'hook_selinux_status_open();' "$F" \
+            || { echo "FATAL: runtime enable path lost the fops hook"; exit 1; }
+          echo "[selinux_hide] default-disabled patch OK: boot=no-op, runtime toggle=full activation"
       # ------------------------------------------------------------------
       # KSN sulog time API fix (idempotent, grep-guarded).
       #
