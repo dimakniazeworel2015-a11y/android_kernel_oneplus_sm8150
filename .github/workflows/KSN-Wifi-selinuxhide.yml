@@ -23,9 +23,12 @@ name: Build kernel (KSN legacy modular + selinux_hide, NO susfs) & WIFI
 #      do not exist in modular KSU-Next legacy; susfs is dropped on 4.14).
 #      Keep CONFIG_KSU=y; add KPROBES+KRETPROBES+KSU_KPROBES_HOOK+
 #      KALLSYMS_ALL; force KSU_MANUAL_HOOK off.
-#   4. KEEP CONFIG_LTO_CLANG=y (device has it; CFI/SCS are off on the
-#      device so LTO can stay on without CFI). Toolchain = AOSP clang that
-#      ships ld.lld with working arm64 ThinLTO/full-LTO.
+#   4. LTO OFF (bootable-first). LTO is only an optimization here — CFI/SCS
+#      are off on this device, so LTO is not boot-critical. LTO+clang was the
+#      failure source, so it is disabled to get a BOOTABLE kernel first.
+#      Toolchain = distro clang-18/lld-18/llvm-18 from apt (/usr/lib/llvm-18/
+#      bin), which built #3-#6 of this 4.14 tree cleanly. The ZyCromerZ
+#      clang-16 rejected the 4.14 LSE-atomics inline asm and was reverted.
 #   5. Preserve every other device option (mm/fs/drivers) untouched.
 #   6. Rebuild qca_cld3-3.0 wlan.ko in-tree so its vermagic matches the
 #      freshly built kernel; keep MODVERSIONS + MODULE_UNLOAD.
@@ -63,12 +66,6 @@ jobs:
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_selinuxhide_wifi' }}
-      # AOSP-based clang (ZyCromerZ mirror) — single-file .tar.gz that ships
-      # clang + ld.lld + LLVMgold with working arm64 full-LTO, plus bundled
-      # aarch64/arm GNU binutils. Extracts to $HOME/clang/bin. Stable URL
-      # (the googlesource +archive slug used before is NOT a real tarball ->
-      # "gzip: stdin: not in gzip format", which failed build run 32093097805).
-      CLANG_URL: 'https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz'
 
     steps:
       - name: Checkout repository (holds hotdogb_defconfig)
@@ -92,27 +89,23 @@ jobs:
         run: |
           sudo rm -rf /opt/ghc /usr/local/share/boost /usr/share/dotnet "$AGENT_TOOLSDIRECTORY" || true
 
-      - name: Install dependencies + AOSP clang (LTO-capable)
+      - name: Install dependencies + apt clang-18 (proven to build this 4.14 tree)
         run: |
           set -euo pipefail
           sudo apt-get update -y
+          # Distro clang-18/lld-18/llvm-18 from apt. Builds #3-#6 of THIS kernel
+          # compiled cleanly with clang-18/lld-18 at /usr/lib/llvm-18/bin.
+          # The ZyCromerZ clang-16 rejected the 4.14 LSE-atomics inline asm
+          # ("unknown register name 'w0' in asm"), so it was reverted.
           sudo apt-get install -y \
+            clang-18 lld-18 llvm-18 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils \
             make python3 libssl-dev libelf-dev build-essential bc bison flex unzip \
             ca-certificates xz-utils cpio device-tree-compiler git git-lfs patch curl
-          # AOSP-based clang (single-file tarball; extracts bin/ at top level)
-          mkdir -p "$HOME/clang"
-          echo "Fetching clang: ${CLANG_URL}"
-          curl -Lfo /tmp/clang.tgz "${CLANG_URL}"
-          # verify it really is gzip before extracting (fail loud otherwise)
-          file /tmp/clang.tgz || true
-          gzip -t /tmp/clang.tgz || { echo "FATAL: clang download is not a gzip tarball"; exit 1; }
-          tar -C "$HOME/clang" -xzf /tmp/clang.tgz
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          test -x "$HOME/clang/bin/clang" || { echo "FATAL: clang binary missing after extract"; ls -la "$HOME/clang"; exit 1; }
-          test -x "$HOME/clang/bin/ld.lld" || { echo "FATAL: ld.lld missing (LTO needs it)"; exit 1; }
-          "$HOME/clang/bin/clang" --version || true
+          test -x /usr/lib/llvm-18/bin/clang || { echo "FATAL: clang-18 missing after apt install"; exit 1; }
+          test -x /usr/lib/llvm-18/bin/ld.lld || { echo "FATAL: ld.lld-18 missing after apt install"; exit 1; }
+          /usr/lib/llvm-18/bin/clang --version || true
           # AnyKernel3 packaging template
           git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
@@ -181,7 +174,7 @@ jobs:
       #   * force KSU_MANUAL_HOOK off (fresh tree has no manual hooks; and
       #     the Kconfig defaults MANUAL_HOOK=y when KPROBES is off, so we
       #     must both enable KPROBES and pin MANUAL_HOOK off)
-      #   * keep CONFIG_LTO_CLANG=y (device has it; CFI/SCS stay off)
+      #   * force LTO off (bootable-first; not boot-critical, CFI/SCS stay off)
       #   * LOCALVERSION="-perf", AUTO off  -> base == 4.14.356-perf
       #   * keep MODVERSIONS + MODULE_UNLOAD (wlan.ko vermagic)
       # Everything else in the device config is preserved untouched.
@@ -226,9 +219,10 @@ jobs:
           CONFIG_MODULES=y
           CONFIG_MODVERSIONS=y
           CONFIG_MODULE_UNLOAD=y
-          # --- keep device LTO (CFI/SCS remain off as on device) ---
-          CONFIG_LTO=y
-          CONFIG_LTO_CLANG=y
+          # --- LTO OFF: not boot-critical (CFI/SCS already off on this device),
+          #     and LTO+clang was the failure source. Get a BOOTABLE kernel first. ---
+          # CONFIG_LTO is not set
+          # CONFIG_LTO_CLANG is not set
           # CONFIG_THINLTO is not set
           EOF
           echo "==== tail of transformed defconfig ===="
@@ -240,7 +234,7 @@ jobs:
         working-directory: kernel
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           mkdir -p out
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 "${KERNEL_DEFCONFIG}"
 
@@ -248,10 +242,10 @@ jobs:
         working-directory: kernel
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           C=out/.config
 
-          # Force the KSN + vermagic + LTO symbols (defconfig can be re-derived
+          # Force the KSN + vermagic symbols (defconfig can be re-derived
           # by olddefconfig; pin them directly in .config, then re-resolve).
           set_y()  { sed -i "s/^# ${1} is not set/${1}=y/; s/^${1}=.*/${1}=y/" "$C"; grep -q "^${1}=y" "$C" || echo "${1}=y" >> "$C"; }
           set_n()  { sed -i "s/^${1}=.*/# ${1} is not set/" "$C"; grep -q "^# ${1} is not set" "$C" || echo "# ${1} is not set" >> "$C"; }
@@ -260,22 +254,25 @@ jobs:
           for e in CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_KALLSYMS_ALL \
                    CONFIG_KSU CONFIG_KSU_KPROBES_HOOK \
                    CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
-                   CONFIG_LTO CONFIG_LTO_CLANG \
                    CONFIG_SMP CONFIG_PREEMPT; do set_y "$e"; done
           set_n CONFIG_KSU_MANUAL_HOOK
           set_n CONFIG_LOCALVERSION_AUTO
+          # LTO OFF: not boot-critical (CFI/SCS off on this device) and LTO+clang
+          # was the failure source. Pin LTO off so olddefconfig can't turn it on.
+          set_n CONFIG_LTO
+          set_n CONFIG_LTO_CLANG
           set_n CONFIG_THINLTO
           # CFI depends on LTO; device has CFI off. Keep it off (do NOT enable).
           set_n CONFIG_CFI_CLANG
           set_str CONFIG_LOCALVERSION "-perf"
 
-          # Re-resolve twice so the KSU + LTO dep chains settle deterministically.
+          # Re-resolve twice so the KSU dep chains settle deterministically.
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
           echo "==== key config after finalize ===="
-          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_KRETPROBES=|CONFIG_KSU_KPROBES_HOOK=|CONFIG_LTO_CLANG=|CONFIG_TASKSTATS=)' "$C" || true
-          grep -E 'CONFIG_LOCALVERSION_AUTO|CONFIG_KSU_MANUAL_HOOK|CONFIG_CFI_CLANG' "$C" || true
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_KRETPROBES=|CONFIG_KSU_KPROBES_HOOK=|CONFIG_TASKSTATS=)' "$C" || true
+          grep -E 'CONFIG_LOCALVERSION_AUTO|CONFIG_KSU_MANUAL_HOOK|CONFIG_CFI_CLANG|CONFIG_LTO' "$C" || true
 
       - name: Hard gate — fail early if boot/vermagic config drifted
         working-directory: kernel
@@ -286,26 +283,28 @@ jobs:
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' "$C" || { echo "FATAL: LOCALVERSION_AUTO on"; exit 1; }
           grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set' "$C" || { echo "FATAL: MANUAL_HOOK not off"; exit 1; }
           for e in CONFIG_KSU CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_KSU_KPROBES_HOOK \
-                   CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_LTO_CLANG \
+                   CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
                    CONFIG_TASKSTATS CONFIG_KALLSYMS_ALL; do
             grep -q "^${e}=y" "$C" || { echo "FATAL: ${e} not =y (device option must be preserved)"; exit 1; }
           done
+          # LTO must be OFF (bootable-first; LTO+clang was the failure source).
+          if grep -q '^CONFIG_LTO_CLANG=y' "$C"; then echo "FATAL: LTO_CLANG still on (must be off)"; exit 1; fi
           # susfs must be entirely gone
           if grep -q 'CONFIG_KSU_SUSFS' "$C"; then echo "FATAL: susfs symbol in .config"; exit 1; fi
-          echo "Boot/vermagic/KSN config gate OK"
+          echo "Boot/vermagic/KSN config gate OK (LTO off)"
 
       - name: Prepare scripts and headers
         working-directory: ./kernel
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 CC="ccache clang" scripts prepare
 
-      - name: Build kernel (LTO, AOSP clang, ld.lld)
+      - name: Build kernel (apt clang-18, ld.lld-18, LTO off)
         working-directory: kernel
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           export KBUILD_BUILD_USER=ci
           export KBUILD_BUILD_HOST=github
 
@@ -313,9 +312,11 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
           # Verify device options that #6 wrongly disabled are STILL on
-          for s in CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_LTO_CLANG; do
+          for s in CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE; do
             grep -q "^${s}=y" out/.config || echo "WARN: ${s} not =y"
           done
+          # LTO is intentionally off here (bootable-first); confirm for the log.
+          grep -q '^# CONFIG_LTO_CLANG is not set' out/.config && echo "LTO off (as intended)" || echo "WARN: LTO not explicitly off"
 
           make -j"$(nproc)" ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 \
             CC="ccache clang" \
@@ -343,7 +344,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             modules_prepare
