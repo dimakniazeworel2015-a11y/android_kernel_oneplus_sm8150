@@ -1,37 +1,49 @@
-name: Build kernel (KSN legacy modular + selinux_hide, NO susfs) & WIFI
+name: Build kernel (KSN FLAT v1.0.6 + SUSFS + manual hooks + selinux_hide) & WIFI
 
 # =====================================================================
 # BOOTABLE rebuild for OnePlus 7T "hotdogb" (SM8150), crDroid 15 / A15.
 #
-# WHY THE PREVIOUS BUILD (#6) BLACK-SCREENED (early panic, no pstore):
-#   * built from LineageOS lineage-22.1 == 4.14.35*5*  (device is .356)
-#     -> appended dtb / kernel base did not match the device -> panic.
-#   * used lineage_sm8150_defconfig (a generic config) instead of the
-#     device's OWN /proc/config.gz -> missing device-critical options.
-#   * a ci.defaults block DISABLED options the device ships =y
-#     (CONFIG_TASKSTATS, HUGETLB*, TRANSPARENT_HUGEPAGE, NFS, BTRFS, KSM...)
-#     -> userspace/driver mismatch -> panic.
-#   * built WITHOUT LTO while the device is CONFIG_LTO_CLANG=y.
+# STRATEGY CHANGE — replicate the device's PROVEN-BOOTING KernelSU setup.
 #
-# WHAT CHANGED HERE (the fixes):
-#   1. SOURCE BRANCH = lineage-23.0  (Makefile SUBLEVEL = 356 == device).
-#      lineage-22.1 is SUBLEVEL 355. Verified via the LineageOS Makefile.
-#   2. BASE DEFCONFIG = the device's real /proc/config.gz, committed to the
-#      repo as arch/arm64/configs/hotdogb_defconfig, used verbatim. We do
-#      NOT disable device options.
-#   3. Strip the OLD FLAT CONFIG_KSU_SUSFS* symbols from that config (they
-#      do not exist in modular KSU-Next legacy; susfs is dropped on 4.14).
-#      Keep CONFIG_KSU=y; add KPROBES+KRETPROBES+KSU_KPROBES_HOOK+
-#      KALLSYMS_ALL; force KSU_MANUAL_HOOK off.
-#   4. LTO OFF (bootable-first). LTO is only an optimization here — CFI/SCS
-#      are off on this device, so LTO is not boot-critical. LTO+clang was the
-#      failure source, so it is disabled to get a BOOTABLE kernel first.
-#      Toolchain = distro clang-18/lld-18/llvm-18 from apt (/usr/lib/llvm-18/
-#      bin), which built #3-#6 of this 4.14 tree cleanly. The ZyCromerZ
-#      clang-16 rejected the 4.14 LSE-atomics inline asm and was reverted.
-#   5. Preserve every other device option (mm/fs/drivers) untouched.
-#   6. Rebuild qca_cld3-3.0 wlan.ko in-tree so its vermagic matches the
-#      freshly built kernel; keep MODVERSIONS + MODULE_UNLOAD.
+# THREE prior builds used KernelSU-Next LEGACY MODULAR + KPROBES and all
+# HANG at early boot (black screen after logo, no pstore log). A build with
+# selinux_hide DISABLED still hung -> the killer is the modular-KSU+KPROBES
+# combination (and/or a dtb/dtbo mismatch), NOT selinux_hide.
+#
+# The device's currently-BOOTING kernel (from /proc/config.gz, committed as
+# device_config) is:
+#   * CONFIG_KSU=y + CONFIG_KSU_SUSFS=y + all CONFIG_KSU_SUSFS_*   -> FLAT KSU + SUSFS
+#   * "# CONFIG_KPROBES is not set"                                -> MANUAL hooks
+#   * CONFIG_LTO_CLANG=y, base 4.14.356
+# So the booting recipe = FLAT KernelSU-Next v1.0.6 + SUSFS + MANUAL syscall
+# hooks + NO kprobes. This workflow reproduces exactly that, and adds a
+# POST-BOOT-deferred selinux_hide (never runs during early init).
+#
+# KEY IMPLEMENTATION FACTS (verified against the KernelSU-Next v1.0.6 tree):
+#   * At v1.0.6 the hook switch is CONFIG_KSU_WITH_KPROBES (default y). There is
+#     NO CONFIG_KSU_MANUAL_HOOK and NO "No hooks were defined" build gate here.
+#     Setting "# CONFIG_KSU_WITH_KPROBES is not set" (with KPROBES off) selects
+#     MANUAL mode: ksu.c only calls ksu_sucompat_init()/ksu_ksud_init() under
+#     #ifdef CONFIG_KSU_WITH_KPROBES, so with it off nothing registers kprobes
+#     and the ksu_*_hook flags stay =true; the kernel's own call sites drive the
+#     handlers. We therefore inject the manual call sites into fs/{exec,open,
+#     read_write,stat}.c (the non-GKI integration), which lineage-23.0 lacks.
+#   * selinux_hide.c ships ONLY in the legacy modular tree. We commit a ported
+#     flat version (selinux_hide.c/.h) that keeps only initialize_fake_status()
+#     + hook_selinux_status_open() (the /sys/fs/selinux/status oracle defeat),
+#     drops the feature-handler framework, the ksu_input_hook wait, the
+#     init-thread and the avc kprobe, and is ENABLED POST-BOOT from the
+#     EVENT_BOOT_COMPLETED path in core_hook.c (not during early init).
+#   * DTB PRESERVE: AnyKernel3 leaves the device's boot dtb / dtbo alone as long
+#     as no separate `dtb` file and no `dtbo.img` are shipped in the zip. We ship
+#     only Image.gz-dtb (appended-dtb) and configure anykernel.sh for A/B.
+#   * PSTORE: device_config already has PSTORE + PSTORE_CONSOLE + PSTORE_RAM +
+#     PSTORE_PMSG =y (verified). We keep them =y so a future hang is captured in
+#     /sys/fs/pstore/console-ramoops-*.
+#   * Toolchain: apt clang-18/lld-18 at /usr/lib/llvm-18/bin, LLVM=1 LLVM_IAS=0
+#     (LLVM_IAS=0 required for 4.14 LSE atomics), GNU as via CROSS_COMPILE.
+#   * LTO: kept OFF (bootable-first; device has it on but it is not boot-critical
+#     and complicates the clang-18 build). CFI/SCS stay off (device has them off).
 # =====================================================================
 
 on:
@@ -52,7 +64,7 @@ on:
       output_name:
         description: 'Name of the output.zip'
         required: false
-        default: 'OP7_KSN_selinuxhide_wifi'
+        default: 'OP7_KSN_flat_susfs_selinuxhide_wifi'
 
 jobs:
   build:
@@ -65,10 +77,13 @@ jobs:
       KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'hotdogb_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_selinuxhide_wifi' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_flat_susfs_selinuxhide_wifi' }}
+      KSU_TAG: "v1.0.6"
+      SUSFS_REPO: "https://github.com/kutemeikito/susfs4ksu"
+      SUSFS_BRANCH: "kernel-4.14"
 
     steps:
-      - name: Checkout repository (holds hotdogb_defconfig)
+      - name: Checkout repository (holds device_config + selinux_hide port)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -93,30 +108,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          # Distro clang-18/lld-18/llvm-18 from apt. Builds #3-#6 of THIS kernel
-          # compiled cleanly with clang-18/lld-18 at /usr/lib/llvm-18/bin.
-          # The ZyCromerZ clang-16 rejected the 4.14 LSE-atomics inline asm
-          # ("unknown register name 'w0' in asm"), so it was reverted.
           sudo apt-get install -y \
             clang-18 lld-18 llvm-18 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils \
             make python3 libssl-dev libelf-dev build-essential bc bison flex unzip \
             ca-certificates xz-utils cpio device-tree-compiler git git-lfs patch curl
-          test -x /usr/lib/llvm-18/bin/clang || { echo "FATAL: clang-18 missing after apt install"; exit 1; }
-          test -x /usr/lib/llvm-18/bin/ld.lld || { echo "FATAL: ld.lld-18 missing after apt install"; exit 1; }
+          test -x /usr/lib/llvm-18/bin/clang || { echo "FATAL: clang-18 missing"; exit 1; }
+          test -x /usr/lib/llvm-18/bin/ld.lld || { echo "FATAL: ld.lld-18 missing"; exit 1; }
           /usr/lib/llvm-18/bin/clang --version || true
-          # GNU assembler is REQUIRED: 4.14 LSE-atomics inline asm
-          # (atomic_lse.h "unknown register name 'w0'") is rejected by clang's
-          # integrated assembler. We build with LLVM=1 LLVM_IAS=0 so clang uses
-          # -fno-integrated-as and calls aarch64-linux-gnu-as (from
-          # binutils-aarch64-linux-gnu). Verify it is reachable.
-          command -v aarch64-linux-gnu-as >/dev/null || { echo "FATAL: aarch64-linux-gnu-as missing (binutils-aarch64-linux-gnu)"; exit 1; }
+          # 4.14 LSE-atomics inline asm is rejected by clang IAS -> use GNU as.
+          command -v aarch64-linux-gnu-as >/dev/null || { echo "FATAL: aarch64-linux-gnu-as missing"; exit 1; }
           aarch64-linux-gnu-as --version | head -1
-          command -v arm-linux-gnueabi-as >/dev/null || { echo "FATAL: arm-linux-gnueabi-as missing (gcc-arm-linux-gnueabi)"; exit 1; }
+          command -v arm-linux-gnueabi-as >/dev/null || { echo "FATAL: arm-linux-gnueabi-as missing"; exit 1; }
           arm-linux-gnueabi-as --version | head -1
-          # AnyKernel3 packaging template
-          git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3
+          # AnyKernel3 packaging template (osm0sis upstream)
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
           rm -rf AnyKernel3/.git
 
       - name: Get Version
@@ -127,195 +134,121 @@ jobs:
           echo "VERSION=$(expr ${COUNT:-0} + 10200)" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
-      # KernelSU-Next `legacy` branch (MODULAR kernel/ layout: kernel/core/,
-      # kernel/feature/, kernel/hook/). NO susfs.
-      #
-      # legacy carries kernel/feature/selinux_hide.c (fake SELinux status
-      # page + patched /sys/fs/selinux/status fops + avc kprobe). It is
-      # independent of susfs, so it compiles/links without the susfs bridge
-      # symbols. setup.sh checks out legacy, symlinks drivers/kernelsu ->
-      # KernelSU-Next/kernel, and edits drivers/Makefile + drivers/Kconfig.
+      # KernelSU-Next FLAT v1.0.6 (kernel/*.c layout: ksu.c, sucompat.c,
+      # ksud.c, core_hook.c, selinux/). setup.sh symlinks drivers/kernelsu ->
+      # KernelSU-Next/kernel and edits drivers/{Makefile,Kconfig}. This is the
+      # exact flat tree the device ships.
       # ------------------------------------------------------------------
-      - name: KernelSU-Next setup (legacy modular)
+      - name: KernelSU-Next setup (FLAT v1.0.6)
         working-directory: ./kernel
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_TAG}/kernel/setup.sh" | bash -s "${KSU_TAG}"
           echo "==== KernelSU-Next checkout ===="
           [ -d KernelSU-Next ] && git -C KernelSU-Next log -1 --oneline || true
-          echo "==== confirm MODULAR layout + selinux_hide.c present ===="
-          test -f KernelSU-Next/kernel/feature/selinux_hide.c \
-            || { echo "FATAL: kernel/feature/selinux_hide.c missing (not legacy modular tree)"; exit 1; }
-          echo "modular KSU-Next tree OK: selinux_hide.c present"
-          # selinux_hide.c: `extern bool ksu_input_hook __read_mostly` (weak)
-          # + a `while (READ_ONCE(ksu_input_hook)) msleep()` wait. With the
-          # kprobes hook (MANUAL_HOOK off) nothing DEFINES the symbol, so the
-          # weak extern resolves to NULL and the wait spins forever /
-          # selinux_hide never inits. Define it =false in a compiled KSU
-          # source so it links to a real symbol AND the wait is skipped.
-          F=KernelSU-Next/kernel/core/init.c
-          if ! grep -q 'bool ksu_input_hook' "$F"; then
-            printf '\n#include <linux/types.h>\n#include <linux/cache.h>\nbool ksu_input_hook __read_mostly = false;\n' >> "$F"
+          echo "==== confirm FLAT layout (kernel/ksu.c, sucompat.c, ksud.c present) ===="
+          for f in KernelSU-Next/kernel/ksu.c KernelSU-Next/kernel/sucompat.c \
+                   KernelSU-Next/kernel/ksud.c KernelSU-Next/kernel/core_hook.c \
+                   KernelSU-Next/kernel/selinux/selinux.c; do
+            test -f "$f" || { echo "FATAL: $f missing (not the flat v1.0.6 tree)"; exit 1; }
+          done
+          # Flat v1.0.6 must NOT have the modular feature/ dir.
+          if [ -d KernelSU-Next/kernel/feature ]; then
+            echo "FATAL: kernel/feature/ present -> this is the modular tree, expected FLAT v1.0.6"; exit 1
           fi
-          echo "ksu_input_hook def:"; grep -n 'ksu_input_hook' "$F" \
-            || { echo "FATAL: ksu_input_hook not defined"; exit 1; }
-
+          echo "FLAT KSU-Next v1.0.6 tree OK"
+          echo "==== drivers/kernelsu symlink ===="
+          ls -l drivers/kernelsu || true
 
       # ------------------------------------------------------------------
-      # selinux_hide: DEFAULT-DISABLED at boot (idempotent, grep-guarded).
-      #
-      # WHY: two prior builds black-screened (hang, no pstore/ramoops panic)
-      # right after the OEM logo. Root cause = selinux_hide auto-enabling at
-      # boot. kernel/feature/selinux_hide.c ships the enable flag defaulted
-      # to TRUE, and ksu_hide_init_thread() runs initialize_fake_status() +
-      # hook_selinux_status_open() UNCONDITIONALLY (the fops-patch of
-      # /sys/fs/selinux/status via vmap + irq-disable) very early -> hang.
-      #
-      # The device's KSU-Next v3.3.0 manager has a runtime selinux_hide
-      # toggle, so selinux_hide is meant to be turned ON from userspace AFTER
-      # boot, not auto-on at boot. This step makes it default-OFF:
-      #   1. flag default TRUE -> FALSE.
-      #   2. ksu_hide_init_thread(): early-return unless the flag is already
-      #      set, so NOTHING (enable, fake status, fops hook) runs at boot.
-      #   3. runtime toggle (selinux_hide_status_feature_set) now performs the
-      #      FULL activation itself (enable + initialize_fake_status +
-      #      hook_selinux_status_open) on ON, and unhook on OFF, because the
-      #      boot thread no longer auto-hooks. ksu_selinux_hide_enable() is
-      #      NOT removed -- only stopped from running automatically at boot.
+      # SUSFS (keep it — preserves the device's hiding + Play Integrity STRONG).
+      # susfs4ksu kernel-4.14: apply the kernel-side 50_ patch at kernel root,
+      # then the KSU-side 10_ bridge inside KernelSU-Next/. Both apply to the
+      # flat v1.0.6 tree (18 target files all present; Kconfig symbols match
+      # device_config exactly: HAS_MAGIC_MOUNT/SUS_PATH/SUS_MOUNT/SPOOF_UNAME/
+      # OPEN_REDIRECT/...).
       # ------------------------------------------------------------------
-      - name: selinux_hide default-disabled at boot (no auto-enable)
+      - name: Apply SUSFS (kernel 50_ patch + KSU 10_ bridge)
         working-directory: ./kernel
         run: |
           set -euo pipefail
-          F=KernelSU-Next/kernel/feature/selinux_hide.c
-          test -f "$F" || { echo "FATAL: $F missing (KSU-Next legacy selinux_hide absent)"; exit 1; }
+          git clone --depth=1 --branch "${SUSFS_BRANCH}" "${SUSFS_REPO}" ../susfs4ksu
+          KP="../susfs4ksu/kernel_patches"
+          test -f "${KP}/50_add_susfs_in_kernel-4.14.patch" || { echo "FATAL: 50_ susfs patch missing"; exit 1; }
+          test -f "${KP}/KernelSU/10_enable_susfs_for_ksu.patch" || { echo "FATAL: 10_ susfs bridge missing"; exit 1; }
 
-          echo "==== selinux_hide flag BEFORE ===="
-          grep -n 'ksu_selinux_hide_is_enabled __read_mostly' "$F" || true
+          echo "==== copy susfs kernel-side sources (fs/ include/) ===="
+          cp -v "${KP}/fs/"* fs/ 2>/dev/null || true
+          cp -v "${KP}/include/linux/"* include/linux/ 2>/dev/null || true
 
-          python3 - "$F" <<'PYEOF'
-          import sys
-          p = sys.argv[1]
-          s = open(p, "r", newline="").read()
+          echo "==== apply kernel-side 50_ susfs patch at kernel root ===="
+          patch -p1 --no-backup-if-mismatch < "${KP}/50_add_susfs_in_kernel-4.14.patch"
 
-          # ---- EDIT 1: default flag TRUE -> FALSE ----
-          if "ksu_selinux_hide_is_enabled __read_mostly = true;" in s:
-              s = s.replace(
-                  "// enabled by default\nstatic bool ksu_selinux_hide_is_enabled __read_mostly = true;",
-                  "// DISABLED by default at boot (CI patch): only the userspace manager toggle enables it\nstatic bool ksu_selinux_hide_is_enabled __read_mostly = false;",
-                  1,
-              )
-              print("[edit1] flag default true -> false")
-          elif "ksu_selinux_hide_is_enabled __read_mostly = false;" in s:
-              print("[edit1] flag already false (idempotent) -- ok")
-          else:
-              sys.exit("[edit1] FATAL: enable-flag declaration not found (upstream changed)")
+          echo "==== apply KSU-side 10_ bridge inside KernelSU-Next/ ===="
+          cp "${KP}/KernelSU/10_enable_susfs_for_ksu.patch" KernelSU-Next/
+          ( cd KernelSU-Next && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
 
-          # ---- EDIT 2: early-return guard in ksu_hide_init_thread ----
-          guard = (
-              "\twhile (READ_ONCE(ksu_input_hook))\n\t\tmsleep(5000);\n\n"
-              "\tif (ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_enable();"
-          )
-          if "CI patch: do nothing at boot" in s:
-              print("[edit2] init-thread guard already present (idempotent) -- ok")
-          elif guard in s:
-              repl = (
-                  "\twhile (READ_ONCE(ksu_input_hook))\n\t\tmsleep(5000);\n\n"
-                  "\t/* CI patch: do nothing at boot unless already enabled (default is now\n"
-                  "\t * false). selinux_hide is meant to be turned on from the userspace\n"
-                  "\t * manager toggle post-boot; auto-hooking the sel status fops this early\n"
-                  "\t * hangs the device. */\n"
-                  "\tif (!READ_ONCE(ksu_selinux_hide_is_enabled))\n\t\treturn 0;\n\n"
-                  "\tif (ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_enable();"
-              )
-              s = s.replace(guard, repl, 1)
-              print("[edit2] init-thread early-return guard inserted")
-          else:
-              sys.exit("[edit2] FATAL: ksu_hide_init_thread anchor not found (upstream changed)")
+          echo "==== susfs sanity: susfs Kconfig symbols now present in KSU Kconfig ===="
+          grep -q 'KSU_SUSFS' KernelSU-Next/kernel/Kconfig || { echo "FATAL: susfs Kconfig bridge not applied"; exit 1; }
+          echo "susfs applied OK"
 
-          # ---- EDIT 3: runtime toggle performs full activation (fops hook) ----
-          setter_old = (
-              "\tif (!ksu_selinux_hide_is_enabled)\n\t\tksu_selinux_hide_disable();\n"
-              "\telse\n\t\tksu_selinux_hide_enable();"
-          )
-          if "CI patch: runtime toggle now installs/removes" in s:
-              print("[edit3] setter full-activation already present (idempotent) -- ok")
-          elif setter_old in s:
-              setter_new = (
-                  "\t/* CI patch: runtime toggle now installs/removes the sel-status fops\n"
-                  "\t * hook itself, because ksu_hide_init_thread no longer auto-hooks at\n"
-                  "\t * boot. Enable path mirrors the old boot-thread tail. */\n"
-                  "\tif (!ksu_selinux_hide_is_enabled) {\n"
-                  "\t\tunhook_selinux_status_open();\n"
-                  "\t\tksu_selinux_hide_disable();\n"
-                  "\t} else {\n"
-                  "\t\tksu_selinux_hide_enable();\n"
-                  "\t\tinitialize_fake_status();\n"
-                  "\t\tif (READ_ONCE(fake_status))\n"
-                  "\t\t\thook_selinux_status_open();\n"
-                  "\t}"
-              )
-              s = s.replace(setter_old, setter_new, 1)
-              print("[edit3] runtime setter full-activation applied")
-          else:
-              sys.exit("[edit3] FATAL: selinux_hide_status_feature_set anchor not found (upstream changed)")
-
-          open(p, "w", newline="").write(s)
-          print("[selinux_hide] wrote", p)
-          PYEOF
-
-          echo "==== selinux_hide flag AFTER (must be = false) ===="
-          grep -n 'ksu_selinux_hide_is_enabled __read_mostly' "$F"
-          grep -q 'ksu_selinux_hide_is_enabled __read_mostly = false;' "$F" \
-            || { echo "FATAL: flag not defaulted to false"; exit 1; }
-          echo "==== ksu_hide_init_thread guard AFTER (must early-return on !enabled) ===="
-          awk '/^static int ksu_hide_init_thread/{f=1} f{print} /^}/{if(f)exit}' "$F"
-          grep -q 'if (!READ_ONCE(ksu_selinux_hide_is_enabled))' "$F" \
-            || { echo "FATAL: boot early-return guard missing"; exit 1; }
-          echo "==== runtime setter AFTER (must call hook_selinux_status_open) ===="
-          awk '/^static int selinux_hide_status_feature_set/{f=1} f{print} /^}/{if(f)exit}' "$F"
-          grep -q 'hook_selinux_status_open();' "$F" \
-            || { echo "FATAL: runtime enable path lost the fops hook"; exit 1; }
-          echo "[selinux_hide] default-disabled patch OK: boot=no-op, runtime toggle=full activation"
       # ------------------------------------------------------------------
-      # KSN sulog time API fix (idempotent, grep-guarded).
-      #
-      # drivers/kernelsu -> KernelSU-Next/kernel (symlink), so the real file
-      # is KernelSU-Next/kernel/sulog/event.c. It declares `struct timespec64
-      # ts` and, in the pre-4.19 #else branch, calls the NON-64
-      # get_monotonic_boottime(struct timespec *) (include/linux/
-      # timekeeping32.h:84) -> "incompatible pointer types passing
-      # 'struct timespec64 *' to parameter of type 'struct timespec *'"
-      # (-Werror) at event.c:62 and :97 on this 4.14.356 tree.
-      #
-      # Fix: call ktime_get_boottime_ts64(struct timespec64 *) instead. That
-      # accessor EXISTS on this tree (include/linux/timekeeping.h:141), takes
-      # a timespec64* (matches the existing `ts` var), and returns identical
-      # boottime seconds. This is type-correct with NO cast and NO
-      # -Wno-error, so it is the safest option (a cast/no-error would only
-      # mask the mismatch). After the sed both #if/#else arms become
-      # identical, which is fine.
+      # MANUAL SYSCALL HOOKS (non-GKI integration) — lineage-23.0 lacks them.
+      # Inject ksu_handle_* call sites into fs/{exec,open,read_write,stat}.c.
+      # Each insertion is anchored to a stable line and hard-asserted, so a
+      # tree drift fails the build loudly instead of silently shipping a
+      # rootless kernel. The generic ksu_handle_execveat (ksu.c) drives both
+      # the sucompat and ksud execve handlers.
       # ------------------------------------------------------------------
-      - name: KSN sulog time API fix (timespec64 -> ktime_get_boottime_ts64)
+      - name: Integrate manual syscall hooks (fs/exec,open,read_write,stat)
         working-directory: ./kernel
         run: |
           set -euo pipefail
+          # Call the committed injector (anchored + hard-asserted + idempotent).
+          python3 "${GITHUB_WORKSPACE}/scripts_ksn/apply_manual_hooks.py" "$(pwd)"
+          echo "==== manual hook call sites ===="
+          grep -n 'ksu_handle_execveat' fs/exec.c | head -3
+          grep -n 'ksu_handle_faccessat' fs/open.c | head -3
+          grep -n 'ksu_handle_sys_read' fs/read_write.c | head -3
+          grep -n 'ksu_handle_stat' fs/stat.c | head -3
+
+      # ------------------------------------------------------------------
+      # Port selinux_hide into the FLAT tree + wire a POST-BOOT deferred enable.
+      # selinux_hide.c/.h are committed in this repo (flat-adapted: only the
+      # fake status page + fops patch, feature-handler/init-thread/kprobe
+      # removed). Copy them into KernelSU-Next/kernel/, add to the Makefile,
+      # and call ksu_selinux_hide_enable_deferred() from EVENT_BOOT_COMPLETED
+      # in core_hook.c (post-boot, NOT early init).
+      # ------------------------------------------------------------------
+      - name: Port selinux_hide into flat tree (deferred, post-boot)
+        working-directory: ./kernel
+        run: |
+          set -euo pipefail
+          # Copies selinux_hide.c/.h into the flat tree, adds selinux_hide.o to
+          # the Makefile, and wires ksu_selinux_hide_enable_deferred() into the
+          # EVENT_BOOT_COMPLETED branch of core_hook.c (post-boot). All anchored
+          # + hard-asserted + idempotent.
+          python3 "${GITHUB_WORKSPACE}/scripts_ksn/port_selinux_hide.py" "$(pwd)" "${GITHUB_WORKSPACE}"
+          echo "==== Makefile obj list ===="
+          grep -n 'kernelsu-objs' KernelSU-Next/kernel/Makefile | head -20
+          echo "==== boot_complete wiring (deferred call must follow the pr_info) ===="
+          grep -n -A1 'boot_complete triggered' KernelSU-Next/kernel/core_hook.c | head
+
+      # KSN sulog time API fix — not needed for flat v1.0.6 (no sulog/ dir).
+      # Kept as a tolerant no-op guard in case a future tree adds it.
+      - name: (Optional) sulog time API fix if present
+        working-directory: ./kernel
+        run: |
+          set -uo pipefail
           F=KernelSU-Next/kernel/sulog/event.c
-          test -f "$F" || { echo "FATAL: $F missing (KSU-Next legacy sulog absent)"; exit 1; }
-          if grep -q 'get_monotonic_boottime(&ts)' "$F"; then
+          if [ -f "$F" ] && grep -q 'get_monotonic_boottime(&ts)' "$F"; then
             sed -i 's/get_monotonic_boottime(&ts)/ktime_get_boottime_ts64(\&ts)/g' "$F"
-            echo "[sulog] patched get_monotonic_boottime -> ktime_get_boottime_ts64"
+            echo "[sulog] patched"
           else
-            echo "[sulog] no non-64 call site (already patched or upstream changed) — ok"
-          fi
-          echo "==== sulog boottime call sites after patch ===="
-          grep -n -E 'ktime_get_boottime_ts64\(&ts\)|get_monotonic_boottime\(&ts\)' "$F" || true
-          if grep -q 'get_monotonic_boottime(&ts)' "$F"; then
-            echo "FATAL: non-64 get_monotonic_boottime(&ts) still present"; exit 1
+            echo "[sulog] not present in flat v1.0.6 (ok)"
           fi
 
-      # Patch 1: arch/arm64/mm/hugetlbpage.c (idempotent, only if the file
-      # has the old shape). Device ships hugetlb pieces so keep it building.
+      # hugetlbpage fix (idempotent) — device ships hugetlb pieces, keep building.
       - name: Apply hugetlbpage fix patch (idempotent, tolerant)
         working-directory: kernel
         run: |
@@ -331,18 +264,18 @@ jobs:
 
       # ------------------------------------------------------------------
       # Install the device's real config as the build base defconfig and
-      # transform it for modular KSU-Next legacy + kprobes + selinux_hide.
-      #   * drop every flat CONFIG_KSU_SUSFS* line (symbol does not exist)
-      #   * flip KPROBES on + KRETPROBES + KSU_KPROBES_HOOK + KALLSYMS_ALL
-      #   * force KSU_MANUAL_HOOK off (fresh tree has no manual hooks; and
-      #     the Kconfig defaults MANUAL_HOOK=y when KPROBES is off, so we
-      #     must both enable KPROBES and pin MANUAL_HOOK off)
-      #   * force LTO off (bootable-first; not boot-critical, CFI/SCS stay off)
+      # transform it to MATCH the device's booting KSU setup:
+      #   * KEEP CONFIG_KSU=y and ALL CONFIG_KSU_SUSFS* (device has them)
+      #   * KEEP "# CONFIG_KPROBES is not set"  (MANUAL hooks like the device)
+      #   * add "# CONFIG_KSU_WITH_KPROBES is not set" (v1.0.6 manual-mode switch)
+      #   * KEEP PSTORE/PSTORE_CONSOLE/PSTORE_RAM/PSTORE_PMSG =y (hang capture)
+      #   * LTO OFF (bootable-first; not boot-critical), CFI/SCS off
       #   * LOCALVERSION="-perf", AUTO off  -> base == 4.14.356-perf
-      #   * keep MODVERSIONS + MODULE_UNLOAD (wlan.ko vermagic)
+      #   * KEEP MODVERSIONS + MODULE_UNLOAD (wlan.ko vermagic)
+      #   * DT overlay OFF (broken .dtbo compile; appended dtb unaffected)
       # Everything else in the device config is preserved untouched.
       # ------------------------------------------------------------------
-      - name: Install device config as base defconfig (transform for KSN legacy)
+      - name: Install device config as base defconfig (match device KSU setup)
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -351,60 +284,47 @@ jobs:
           test -f "$SRC" || { echo "FATAL: device_config not found at $SRC"; exit 1; }
           cp "$SRC" "$DST"
 
-          echo "==== strip flat susfs symbols (modular legacy has none) ===="
-          sed -i '/^CONFIG_KSU_SUSFS/d;/^# CONFIG_KSU_SUSFS.* is not set$/d' "$DST"
-          # drop the now-empty "KernelSU - SUSFS" comment header line too
-          sed -i '/# KernelSU - SUSFS/d' "$DST"
-
-          echo "==== apply KSN-legacy + kprobes + vermagic deltas ===="
-          # helper: set a symbol to a value in the defconfig fragment style
+          echo "==== apply KSN-flat/manual/vermagic/LTO deltas (keep susfs + kprobes-off) ===="
           drop() { sed -i "/^${1}=/d;/^# ${1} is not set$/d" "$DST"; }
-          for s in CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_KALLSYMS_ALL \
-                   CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_KPROBES_HOOK \
+          for s in CONFIG_KPROBES CONFIG_KRETPROBES \
+                   CONFIG_KSU_WITH_KPROBES CONFIG_KSU_KPROBES_HOOK CONFIG_KSU_MANUAL_HOOK \
                    CONFIG_LOCALVERSION CONFIG_LOCALVERSION_AUTO \
                    CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
-                   CONFIG_LTO CONFIG_LTO_CLANG CONFIG_THINLTO \
+                   CONFIG_LTO CONFIG_LTO_CLANG CONFIG_THINLTO CONFIG_CFI_CLANG \
                    CONFIG_BUILD_ARM64_DT_OVERLAY; do
             drop "$s"
           done
-          cat >> "$DST" <<'EOF'
-          # --- KernelSU-Next (legacy modular) + kprobes hooks, NO susfs ---
-          CONFIG_KPROBES=y
-          CONFIG_KRETPROBES=y
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=y
+          # NOTE: pipe through sed to strip the YAML indentation so every
+          # appended line starts at column 0 (kconfig ignores indented lines).
+          sed 's/^[[:space:]]*//' >> "$DST" <<'EOF'
+          # --- KernelSU-Next FLAT v1.0.6: MANUAL hooks, NO kprobes (like device) ---
+          # CONFIG_KPROBES is not set
+          # CONFIG_KSU_WITH_KPROBES is not set
           CONFIG_KSU=y
-          # CONFIG_KSU_MANUAL_HOOK is not set
-          CONFIG_KSU_KPROBES_HOOK=y
-          # --- vermagic base: 4.14.356-perf (device: -perf, AUTO adds git sha) ---
+          # --- vermagic base: 4.14.356-perf (device: -perf, AUTO adds git sha off) ---
           CONFIG_LOCALVERSION="-perf"
           # CONFIG_LOCALVERSION_AUTO is not set
           # --- module loading (wlan.ko vermagic parts) ---
           CONFIG_MODULES=y
           CONFIG_MODVERSIONS=y
           CONFIG_MODULE_UNLOAD=y
-          # --- LTO OFF: not boot-critical (CFI/SCS already off on this device),
-          #     and LTO+clang was the failure source. Get a BOOTABLE kernel first. ---
+          # --- LTO OFF (bootable-first; not boot-critical, CFI/SCS off on device) ---
           # CONFIG_LTO is not set
           # CONFIG_LTO_CLANG is not set
           # CONFIG_THINLTO is not set
-          # --- DT overlay OFF: BUILD_ARM64_DT_OVERLAY=y makes `dtbs` compile
-          #     sm8150-mtp-overlay.dtbo (a /plugin/ overlay) with the in-tree
-          #     scripts/dtc, which chokes on the base pm8150.dtsi top-level
-          #     `&spmi_bus {}` reference ("pm8150.dtsi:21.1-10 syntax error").
-          #     The bootable image is the APPENDED_DTB_IMAGE (Image.gz-dtb) built
-          #     from the plain board .dtb files (sm8150*.dtb compile fine); the
-          #     .dtbo overlay is NOT used by this AnyKernel3 appended-dtb flow.
-          #     Overlay and APPENDED_DTB_IMAGE are independent Kconfigs (both
-          #     only depends-on OF), so disabling overlay keeps the boot dtb.
-          #     With overlay off the dts Makefile builds plain sm8150-v2-mtp.dtb
-          #     instead, and DTC_FLAGS=-@ is not exported. ---
+          # CONFIG_CFI_CLANG is not set
+          # --- DT overlay OFF: broken .dtbo compile; appended boot dtb unaffected ---
           # CONFIG_BUILD_ARM64_DT_OVERLAY is not set
+          # --- pstore/ramoops console capture (hang forensics) ---
+          CONFIG_PSTORE=y
+          CONFIG_PSTORE_CONSOLE=y
+          CONFIG_PSTORE_PMSG=y
+          CONFIG_PSTORE_RAM=y
           EOF
+          echo "==== assert susfs symbols are PRESERVED (device ships them) ===="
+          grep -q '^CONFIG_KSU_SUSFS=y' "$DST" || { echo "FATAL: CONFIG_KSU_SUSFS dropped (must keep)"; exit 1; }
           echo "==== tail of transformed defconfig ===="
-          tail -n 30 "$DST"
-          echo "==== assert no susfs symbol remains ===="
-          if grep -q 'CONFIG_KSU_SUSFS' "$DST"; then echo "FATAL: susfs symbol survived"; exit 1; fi
+          tail -n 40 "$DST"
 
       - name: Seed .config from device defconfig
         working-directory: kernel
@@ -416,70 +336,68 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "${KERNEL_DEFCONFIG}"
 
-      - name: Finalize + enforce KSN/vermagic/LTO (non-interactive)
+      - name: Finalize + enforce KSN-flat/manual/vermagic (non-interactive)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           C=out/.config
-
-          # Force the KSN + vermagic symbols (defconfig can be re-derived
-          # by olddefconfig; pin them directly in .config, then re-resolve).
           set_y()  { sed -i "s/^# ${1} is not set/${1}=y/; s/^${1}=.*/${1}=y/" "$C"; grep -q "^${1}=y" "$C" || echo "${1}=y" >> "$C"; }
           set_n()  { sed -i "s/^${1}=.*/# ${1} is not set/" "$C"; grep -q "^# ${1} is not set" "$C" || echo "# ${1} is not set" >> "$C"; }
           set_str(){ sed -i "s/^${1}=.*/${1}=\"${2}\"/" "$C"; grep -q "^${1}=" "$C" || echo "${1}=\"${2}\"" >> "$C"; }
 
-          for e in CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_KALLSYMS_ALL \
-                   CONFIG_KSU CONFIG_KSU_KPROBES_HOOK \
-                   CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
-                   CONFIG_SMP CONFIG_PREEMPT; do set_y "$e"; done
+          # KSU on + MANUAL hooks: KPROBES + WITH_KPROBES must be OFF.
+          set_y CONFIG_KSU
+          set_n CONFIG_KPROBES
+          set_n CONFIG_KRETPROBES
+          set_n CONFIG_KSU_WITH_KPROBES
+          set_n CONFIG_KSU_KPROBES_HOOK
           set_n CONFIG_KSU_MANUAL_HOOK
+          # module + vermagic
+          for e in CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
+                   CONFIG_SMP CONFIG_PREEMPT \
+                   CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_PMSG CONFIG_PSTORE_RAM; do set_y "$e"; done
           set_n CONFIG_LOCALVERSION_AUTO
-          # LTO OFF: not boot-critical (CFI/SCS off on this device) and LTO+clang
-          # was the failure source. Pin LTO off so olddefconfig can't turn it on.
           set_n CONFIG_LTO
           set_n CONFIG_LTO_CLANG
           set_n CONFIG_THINLTO
-          # CFI depends on LTO; device has CFI off. Keep it off (do NOT enable).
           set_n CONFIG_CFI_CLANG
-          # DT overlay OFF: the sm8150-mtp-overlay.dtbo (/plugin/) fails to
-          # compile with the in-tree dtc on this 4.14 tree (pm8150.dtsi top-level
-          # &spmi_bus{} syntax error). The bootable Image.gz-dtb comes from the
-          # APPENDED_DTB_IMAGE (plain board .dtb), independent of overlay. Pin off
-          # so olddefconfig (overlay only depends-on OF) can't re-enable it.
           set_n CONFIG_BUILD_ARM64_DT_OVERLAY
           set_str CONFIG_LOCALVERSION "-perf"
 
-          # Re-resolve twice so the KSU dep chains settle deterministically.
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
 
           echo "==== key config after finalize ===="
-          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_KRETPROBES=|CONFIG_KSU_KPROBES_HOOK=|CONFIG_TASKSTATS=)' "$C" || true
-          grep -E 'CONFIG_LOCALVERSION_AUTO|CONFIG_KSU_MANUAL_HOOK|CONFIG_CFI_CLANG|CONFIG_LTO' "$C" || true
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS=|CONFIG_MODULE_UNLOAD=|CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_PSTORE=|CONFIG_PSTORE_RAM=)' "$C" || true
+          echo "==== these MUST be off (manual hooks) ===="
+          grep -E 'CONFIG_KPROBES|CONFIG_KSU_WITH_KPROBES|CONFIG_LTO_CLANG|CONFIG_LOCALVERSION_AUTO' "$C" || true
 
-      - name: Hard gate — fail early if boot/vermagic config drifted
+      - name: Hard gate — fail early if boot/vermagic/KSU config drifted
         working-directory: kernel
         run: |
           set -euo pipefail
           C=out/.config
           grep -q '^CONFIG_LOCALVERSION="-perf"' "$C" || { echo "FATAL: LOCALVERSION wrong"; exit 1; }
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' "$C" || { echo "FATAL: LOCALVERSION_AUTO on"; exit 1; }
-          grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set' "$C" || { echo "FATAL: MANUAL_HOOK not off"; exit 1; }
-          for e in CONFIG_KSU CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_KSU_KPROBES_HOOK \
-                   CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
-                   CONFIG_TASKSTATS CONFIG_KALLSYMS_ALL; do
-            grep -q "^${e}=y" "$C" || { echo "FATAL: ${e} not =y (device option must be preserved)"; exit 1; }
+          # MANUAL hooks: KPROBES + WITH_KPROBES must be OFF (this is the device's setup)
+          grep -q '^# CONFIG_KPROBES is not set' "$C" || { echo "FATAL: KPROBES on (must be off for manual hooks)"; exit 1; }
+          if grep -q '^CONFIG_KSU_WITH_KPROBES=y' "$C"; then echo "FATAL: KSU_WITH_KPROBES on (must be off)"; exit 1; fi
+          # KSU + susfs must be present (device ships them)
+          grep -q '^CONFIG_KSU=y' "$C" || { echo "FATAL: CONFIG_KSU not =y"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y' "$C" || { echo "FATAL: CONFIG_KSU_SUSFS not =y (device ships susfs)"; exit 1; }
+          # device options that must survive
+          for e in CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD CONFIG_TASKSTATS CONFIG_KALLSYMS_ALL \
+                   CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_RAM; do
+            grep -q "^${e}=y" "$C" || { echo "FATAL: ${e} not =y"; exit 1; }
           done
-          # LTO must be OFF (bootable-first; LTO+clang was the failure source).
-          if grep -q '^CONFIG_LTO_CLANG=y' "$C"; then echo "FATAL: LTO_CLANG still on (must be off)"; exit 1; fi
-          # susfs must be entirely gone
-          if grep -q 'CONFIG_KSU_SUSFS' "$C"; then echo "FATAL: susfs symbol in .config"; exit 1; fi
-          # DT overlay must be OFF (broken .dtbo compile; appended dtb is unaffected)
-          if grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' "$C"; then echo "FATAL: DT_OVERLAY still on (breaks dtbs)"; exit 1; fi
-          echo "Boot/vermagic/KSN config gate OK (LTO off, DT overlay off)"
+          # LTO off (bootable-first)
+          if grep -q '^CONFIG_LTO_CLANG=y' "$C"; then echo "FATAL: LTO_CLANG on (must be off)"; exit 1; fi
+          # DT overlay off (broken .dtbo compile)
+          if grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' "$C"; then echo "FATAL: DT_OVERLAY on"; exit 1; fi
+          echo "Boot/vermagic/KSU config gate OK (FLAT KSU + susfs + manual hooks + pstore, LTO off, overlay off)"
 
       - name: Prepare scripts and headers
         working-directory: ./kernel
@@ -498,27 +416,23 @@ jobs:
           export KBUILD_BUILD_USER=ci
           export KBUILD_BUILD_HOST=github
 
-          # Final safety re-resolve
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- olddefconfig
 
-          # Verify device options that #6 wrongly disabled are STILL on
-          for s in CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE; do
+          for s in CONFIG_TASKSTATS CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_PSTORE_RAM; do
             grep -q "^${s}=y" out/.config || echo "WARN: ${s} not =y"
           done
-          # LTO is intentionally off here (bootable-first); confirm for the log.
           grep -q '^# CONFIG_LTO_CLANG is not set' out/.config && echo "LTO off (as intended)" || echo "WARN: LTO not explicitly off"
 
           make -j"$(nproc)" ARCH=arm64 O=out LLVM=1 LLVM_IAS=0 \
             CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          # LineageOS sm8150 builds an appended Image.gz-dtb (dtb glued on).
           ls -lah out/arch/arm64/boot/ || true
+          # Ship ONLY the appended-dtb image so AnyKernel3 preserves the device dtb/dtbo.
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             cp out/arch/arm64/boot/Image.gz-dtb ../AnyKernel3/
-          fi
-          if [ -f out/arch/arm64/boot/Image ]; then
+          elif [ -f out/arch/arm64/boot/Image ]; then
             cp out/arch/arm64/boot/Image ../AnyKernel3/
           fi
           test -f ../AnyKernel3/Image.gz-dtb || test -f ../AnyKernel3/Image \
@@ -554,6 +468,33 @@ jobs:
             echo "--- $ko ---"
             /sbin/modinfo "$ko" 2>/dev/null | grep -i vermagic || strings "$ko" | grep -m1 'SMP preempt' || true
           done
+
+      # ------------------------------------------------------------------
+      # Configure AnyKernel3 to flash ONLY the kernel and PRESERVE the device's
+      # dtb + dtbo. Mechanism: AnyKernel3 falls back to the unpacked originals
+      # for any component NOT shipped in the zip. We ship only Image.gz-dtb
+      # (dtb appended), and ship NO separate `dtb` file and NO `dtbo.img`, so the
+      # boot ramdisk keeps its original dtb and the dtbo partition is untouched.
+      # A/B (hotdogb): IS_SLOT_DEVICE=1, BLOCK=boot by-name, keep vbmeta auto.
+      # ------------------------------------------------------------------
+      - name: Configure AnyKernel3 (kernel-only, preserve dtb/dtbo, A/B)
+        run: |
+          set -euo pipefail
+          AK=AnyKernel3/anykernel.sh
+          test -f "$AK" || { echo "FATAL: anykernel.sh missing"; exit 1; }
+          # ensure no stray dtb/dtbo artifacts get packed (presence in the zip
+          # is what makes AnyKernel3 overwrite them; absence = preserve).
+          rm -f AnyKernel3/dtb AnyKernel3/dtb.img AnyKernel3/dtbo AnyKernel3/dtbo.img AnyKernel3/recovery_dtbo 2>/dev/null || true
+
+          python3 "${GITHUB_WORKSPACE}/scripts_ksn/config_anykernel.py" "$AK"
+          echo "==== anykernel.sh key lines ===="
+          grep -nE '^(kernel\.string|do\.devicecheck|do\.modules|BLOCK|IS_SLOT_DEVICE|RAMDISK_COMPRESSION|PATCH_VBMETA_FLAG)=' "$AK" | head -20
+          echo "==== AnyKernel3 zip contents (must contain Image.gz-dtb, NO dtb/dtbo) ===="
+          ls -la AnyKernel3/ | grep -iE 'image|dtb' || true
+          if ls AnyKernel3/ | grep -qiE '^(dtb|dtbo|dtbo\.img|dtb\.img)$'; then
+            echo "FATAL: a dtb/dtbo file is in the zip; would overwrite device dtb"; exit 1
+          fi
+          echo "dtb/dtbo preserve OK (only Image.gz-dtb shipped)"
 
       - name: Package Kernel (AnyKernel3)
         run: |
